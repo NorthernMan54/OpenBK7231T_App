@@ -25,6 +25,27 @@
 #define MAX_DGR_PACKET 128
 #define MAX_DGR_QUEUE_SIZE 8
 
+static void DRV_DGR_ProcessTextCommand(const char *value, byte length) {
+	char command[MAX_DGR_PACKET];
+	size_t copyLength = length;
+	if (copyLength && value[copyLength - 1] == '\0') copyLength--;
+	if (copyLength >= sizeof(command)) copyLength = sizeof(command) - 1;
+	memcpy(command, value, copyLength);
+	command[copyLength] = '\0';
+	if (command[0]) CMD_ExecuteCommand(command, COMMAND_FLAG_SOURCE_SCRIPT);
+}
+
+static void DRV_DGR_ProcessEvent(const char *value, byte length) {
+	char command[MAX_DGR_PACKET];
+	size_t valueLength = length;
+	if (valueLength && value[valueLength - 1] == '\0') valueLength--;
+	if (valueLength > sizeof(command) - 7) valueLength = sizeof(command) - 7;
+	memcpy(command, "event ", 6);
+	memcpy(command + 6, value, valueLength);
+	command[6 + valueLength] = '\0';
+	CMD_ExecuteCommand(command, COMMAND_FLAG_SOURCE_SCRIPT);
+}
+
 static const char* dgr_group = "239.255.250.250";
 static int dgr_port = 4447;
 static int dgr_retry_time_left = 5;
@@ -46,6 +67,7 @@ static uint16_t g_dgr_reliable_message_length = 0;
 static uint16_t g_dgr_reliable_sequence = 0;
 static uint16_t g_dgr_last_full_status_sequence = 0xFFFF;
 static uint16_t g_dgr_incoming_flags = 0;
+static uint32_t g_dgr_no_status_share = 0;
 static uint32_t g_dgr_next_ack_check_time = 0;
 static uint32_t g_dgr_member_timeout_time = 0;
 static uint16_t g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
@@ -341,10 +363,10 @@ void DRV_DGR_Send_FixedColor(const char *groupName, int colorIndex) {
 void DRV_DGR_SendAnnouncement(const char *groupName) {
 	int len;
 	byte message[64];
-	
+
 	// Announcements are always sent, even during command processing
 	len = DGR_Quick_FormatAnnouncement(message, sizeof(message), groupName, g_dgr_send_seq);
-	
+
 	// Don't increment sequence for announcements (they use current sequence)
 	// But we still queue them
 	DGR_AddToSendQueue(message, len);
@@ -498,6 +520,7 @@ typedef struct dgrMmember_s {
 	int ip;
 	uint16_t lastSeq;
 	uint16_t acked_sequence;			// Last sequence we received ACK for
+	uint32_t unicast_count;
 } dgrMember_t;
 
 #define MAX_DGR_MEMBERS 32
@@ -528,12 +551,13 @@ dgrMember_t *findMember() {
 	g_dgrMembers[i].ip = ip;
 	g_dgrMembers[i].lastSeq = 0;
 	g_dgrMembers[i].acked_sequence = 0;
+	g_dgrMembers[i].unicast_count = 0;
 	return &g_dgrMembers[i];
 }
 
 int DGR_CheckSequence(uint16_t seq) {
 	dgrMember_t *m;
-	
+
 	m = findMember();
 	
 	if (m == 0) {
@@ -689,7 +713,7 @@ void DRV_DGR_SendFullStatus(const char *groupName) {
 	}
 
 	len = DGR_Quick_FormatFullStatus(message, sizeof(message), groupName, g_dgr_send_seq,
-		relayStates, numChannels, shareFlags, brightness, scheme, rgbcw);
+		relayStates, numChannels, shareFlags, g_dgr_no_status_share, brightness, scheme, rgbcw);
 	if (len > 0 && DGR_AddToSendQueueInternal(message, len, 0)) {
 		// Tasmota multicasts full status so every member can refresh its view.
 		DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
@@ -779,6 +803,7 @@ static void DGR_RunReliability(uint32_t now) {
 				g_dgr_reliable_message_length, g_dgrMembers[i].ip)) {
 				break;
 			}
+			g_dgrMembers[i].unicast_count++;
 			g_dgr_retry_member_cursor = (i + 1) % memberCount;
 		}
 	}
@@ -840,6 +865,7 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	strcpy_safe(def.gr.groupName, CFG_DeviceGroups_GetName(), sizeof(def.gr.groupName));
 	def.gr.devGroupShare_In = CFG_DeviceGroups_GetRecvFlags();
 	def.gr.devGroupShare_Out = CFG_DeviceGroups_GetSendFlags();
+	def.gr.noStatusShare = &g_dgr_no_status_share;
 #if ENABLE_LED_BASIC
 	def.cbs.processBrightnessPowerOn = DRV_DGR_processBrightnessPowerOn;
 	def.cbs.processLightBrightness = DRV_DGR_processLightBrightness;
@@ -847,6 +873,8 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	def.cbs.processRGBCW = DRV_DGR_processRGBCW;
 #endif
 	def.cbs.processPower = DRV_DGR_processPower;
+	def.cbs.processEvent = DRV_DGR_ProcessEvent;
+	def.cbs.processCommand = DRV_DGR_ProcessTextCommand;
 	def.cbs.checkSequence = DGR_CheckSequence;
 	def.cbs.sendFullStatus = DRV_DGR_SendFullStatus_Callback;
 
@@ -869,7 +897,7 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 			addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_ProcessIncomingPacket: Sent unicast ACK for sequence %u", sequence);
 		}
 	}
-	
+
 	g_inCmdProcessing = 0;
 
 }
@@ -949,6 +977,7 @@ void DRV_DGR_Shutdown()
 	g_dgr_next_ack_check_time = 0;
 	g_dgr_last_full_status_sequence = 0xFFFF;
 	g_dgr_incoming_flags = 0;
+	g_dgr_no_status_share = 0;
 	g_dgr_retry_member_cursor = 0;
 }
 
@@ -1176,6 +1205,80 @@ commandResult_t CMD_DGR_SendFixedColor(const void *context, const char *cmd, con
 	return CMD_RES_OK;
 }
 
+static commandResult_t CMD_DGR_DevGroupSend(const void *context, const char *cmd, const char *args, int flags) {
+	byte message[MAX_DGR_PACKET];
+	dgrDevice_t def;
+	int len;
+	const char *groupName = CFG_DeviceGroups_GetName();
+	if (!groupName || !groupName[0] || !args || !args[0]) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	len = DGR_Quick_FormatCommand(message, sizeof(message), groupName, g_dgr_send_seq, args);
+	if (len <= 0) return CMD_RES_BAD_ARGUMENT;
+	if (!DGR_AddToSendQueueInternal(message, len, 0)) return CMD_RES_ERROR;
+	DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
+	g_dgr_send_seq++;
+	if (!g_dgr_send_seq) g_dgr_send_seq = 1;
+
+	/* Tasmota's DevGroupSend applies the update locally as well. */
+	memset(&def, 0, sizeof(def));
+	strcpy_safe(def.gr.groupName, groupName, sizeof(def.gr.groupName));
+	def.gr.devGroupShare_In = 0xFFFFFFFF;
+	def.gr.noStatusShare = &g_dgr_no_status_share;
+	def.gr.local = true;
+#if ENABLE_LED_BASIC
+	def.cbs.processBrightnessPowerOn = DRV_DGR_processBrightnessPowerOn;
+	def.cbs.processLightBrightness = DRV_DGR_processLightBrightness;
+	def.cbs.processLightFixedColor = DRV_DGR_processLightFixedColor;
+	def.cbs.processRGBCW = DRV_DGR_processRGBCW;
+#endif
+	def.cbs.processPower = DRV_DGR_processPower;
+	def.cbs.processEvent = DRV_DGR_ProcessEvent;
+	def.cbs.processCommand = DRV_DGR_ProcessTextCommand;
+	g_inCmdProcessing = 1;
+	DGR_Parse(message, len, &def, (struct sockaddr *)&g_mySockAddr);
+	g_inCmdProcessing = 0;
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_DGR_DevGroupName(const void *context, const char *cmd, const char *args, int flags) {
+	if (args && args[0]) {
+		CFG_DeviceGroups_SetName((strcmp(args, "0") == 0 || strcmp(args, "\"") == 0) ? "" : args);
+		CFG_Save_IfThereArePendingChanges();
+	}
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupName %s", CFG_DeviceGroups_GetName());
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_DGR_DevGroupShare(const void *context, const char *cmd, const char *args, int flags) {
+	char *end;
+	uint32_t shareIn;
+	uint32_t shareOut;
+	if (args && args[0]) {
+		shareIn = strtoul(args, &end, 0);
+		while (*end == ' ' || *end == ',') end++;
+		shareOut = *end ? strtoul(end, 0, 0) : shareIn;
+		CFG_DeviceGroups_SetRecvFlags(shareIn);
+		CFG_DeviceGroups_SetSendFlags(shareOut);
+		CFG_Save_IfThereArePendingChanges();
+	}
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupShare In=%08X Out=%08X",
+		CFG_DeviceGroups_GetRecvFlags(), CFG_DeviceGroups_GetSendFlags());
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_DGR_DevGroupStatus(const void *context, const char *cmd, const char *args, int flags) {
+	int i;
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupStatus GroupName=%s MessageSeq=%u MemberCount=%i",
+		CFG_DeviceGroups_GetName(), g_dgr_send_seq, g_curDGRMembers);
+	for (i = 0; i < g_curDGRMembers; i++) {
+		struct in_addr memberAddress;
+		memberAddress.s_addr = g_dgrMembers[i].ip;
+		addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "Member %s ResendCount=%u LastRcvdSeq=%u LastAckedSeq=%u",
+			inet_ntoa(memberAddress), g_dgrMembers[i].unicast_count,
+			g_dgrMembers[i].lastSeq, g_dgrMembers[i].acked_sequence);
+	}
+	return CMD_RES_OK;
+}
+
 void DRV_DGR_Init()
 {
 	memset(&g_dgrMembers[0],0,sizeof(g_dgrMembers));
@@ -1224,4 +1327,8 @@ void DRV_DGR_Init()
 	//cmddetail:"fn":"CMD_DGR_SendFixedColor","file":"driver/drv_tasmotaDeviceGroups.c","requires":"",
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("DGR_SendFixedColor", CMD_DGR_SendFixedColor, NULL);
+	CMD_RegisterCommand("DevGroupSend", CMD_DGR_DevGroupSend, NULL);
+	CMD_RegisterCommand("DevGroupName", CMD_DGR_DevGroupName, NULL);
+	CMD_RegisterCommand("DevGroupShare", CMD_DGR_DevGroupShare, NULL);
+	CMD_RegisterCommand("DevGroupStatus", CMD_DGR_DevGroupStatus, NULL);
 }

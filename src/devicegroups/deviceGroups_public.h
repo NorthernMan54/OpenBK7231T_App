@@ -18,6 +18,13 @@ typedef struct dgrCallbacks_s {
 	void (*processLightBrightness)(byte brightness);
 	void (*processLightFixedColor)(byte colorCode);
 	void (*processRGBCW)(byte *rgbcw);
+	void (*processLightFade)(byte value);
+	void (*processLightSpeed)(byte value);
+	void (*processLightScheme)(byte value);
+	void (*processBrightnessPresetLow)(byte value);
+	void (*processBrightnessPresetHigh)(byte value);
+	void (*processEvent)(const char *value, byte length);
+	void (*processCommand)(const char *value, byte length);
 	int (*checkSequence)(uint16_t seq);
 	void (*sendFullStatus)(void);
 } dgrCallbacks_t;
@@ -26,6 +33,8 @@ typedef struct dgrGroupDef_s {
 	char groupName[32];
 	unsigned int devGroupShare_In;
 	unsigned int devGroupShare_Out;
+	unsigned int *noStatusShare;
+	bool local;
 } dgrGroupDef_t;
 
 typedef struct dgrDevice_s {
@@ -46,6 +55,8 @@ int DGR_Quick_FormatAnnouncement(byte *buffer, int maxSize, const char *groupNam
 int DGR_Quick_FormatStatusRequest(byte *buffer, int maxSize, const char *groupName, uint16_t sequence);
 int DGR_Quick_FormatStatusRequestWithFlags(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, int flags);
 int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
-	int relayStates, int numChannels, int shareFlags, byte brightness, byte scheme, const byte *rgbcw);
+	int relayStates, int numChannels, int shareFlags, unsigned int noStatusShare,
+	byte brightness, byte scheme, const byte *rgbcw);
+int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, const char *items);
 
 #endif

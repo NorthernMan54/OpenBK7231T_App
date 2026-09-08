@@ -146,13 +146,15 @@ int DGR_Quick_FormatStatusRequestWithFlags(byte *buffer, int maxSize, const char
 }
 
 int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
-	int relayStates, int numChannels, int shareFlags, byte brightness, byte scheme, const byte *rgbcw) {
+	int relayStates, int numChannels, int shareFlags, unsigned int noStatusShare,
+	byte brightness, byte scheme, const byte *rgbcw) {
 	bitMessage_t msg;
+	shareFlags &= ~noStatusShare;
 	MSG_BeginWriting(&msg, buffer, maxSize);
 	if (DGR_BeginWriting(&msg, groupName, sequence, DGR_FLAG_FULL_STATUS)) {
 		return 0;
 	}
-	DGR_AppendNoStatusShare(&msg, 0);
+	DGR_AppendNoStatusShare(&msg, noStatusShare);
 	if (shareFlags & DGR_SHARE_POWER) {
 		DGR_AppendPowerState(&msg, numChannels, relayStates);
 	}
@@ -166,5 +168,101 @@ int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName,
 		DGR_AppendColorRGBCW(&msg, rgbcw[0], rgbcw[1], rgbcw[2], rgbcw[3], rgbcw[4]);
 	}
 	DGR_Finish(&msg);
+	return msg.position;
+}
+
+static uint32_t dgr_command_values_8[64];
+static uint32_t dgr_command_values_16[64];
+static uint32_t dgr_command_values_32[64];
+
+static uint32_t *DGR_CommandValueSlot(byte item) {
+	if (item <= DGR_ITEM_MAX_8BIT) return &dgr_command_values_8[item];
+	if (item <= DGR_ITEM_MAX_16BIT) return &dgr_command_values_16[item - DGR_ITEM_MAX_8BIT - 1];
+	if (item <= DGR_ITEM_MAX_32BIT) return &dgr_command_values_32[item - DGR_ITEM_MAX_16BIT - 1];
+	return 0;
+}
+
+int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, const char *items) {
+	bitMessage_t msg;
+	const char *p = items;
+	int itemCount = 0;
+	MSG_BeginWriting(&msg, buffer, maxSize);
+	if (DGR_BeginWriting(&msg, groupName, sequence, 0)) return -1;
+	while (p && *p) {
+		char *end;
+		unsigned long parsedItem;
+		byte item;
+		bool noShare = false;
+		while (*p == ' ') p++;
+		if (!*p) break;
+		parsedItem = strtoul(p, &end, 0);
+		if (end == p || parsedItem == 0 || parsedItem > 255 || *end != '=') return -1;
+		item = (byte)parsedItem;
+		p = end + 1;
+		if (*p == 'N' || *p == 'n') { noShare = true; p++; }
+		if (noShare && (!MSG_WriteByte(&msg, DGR_ITEM_FLAGS) || !MSG_WriteByte(&msg, DGR_ITEM_FLAG_NO_SHARE))) return -1;
+		if (!MSG_WriteByte(&msg, item)) return -1;
+		if (item <= DGR_ITEM_MAX_32BIT) {
+			uint32_t value;
+			uint32_t *slot = DGR_CommandValueSlot(item);
+			char oper = 0;
+			if (*p == '@') { oper = p[1]; p += 2; }
+			value = (*p >= '0' && *p <= '9') ? strtoul(p, &end, 0) : (oper == '^' ? 0xFFFFFFFF : 1);
+			if (*p >= '0' && *p <= '9') p = end;
+			if (oper && slot) {
+				if (oper == '+') value = *slot + value;
+				else if (oper == '-') value = *slot - value;
+				else if (oper == '^') value = *slot ^ value;
+				else if (oper == '|') value = *slot | value;
+				else if (oper == '&') value = *slot & value;
+				else return -1;
+			}
+			if (item == DGR_ITEM_POWER && !(value >> 24)) value |= 1UL << 24;
+			if (slot) *slot = value;
+			if (!MSG_WriteByte(&msg, value & 0xFF)) return -1;
+			if (item > DGR_ITEM_MAX_8BIT && !MSG_WriteByte(&msg, (value >> 8) & 0xFF)) return -1;
+			if (item > DGR_ITEM_MAX_16BIT
+				&& (!MSG_WriteByte(&msg, (value >> 16) & 0xFF) || !MSG_WriteByte(&msg, (value >> 24) & 0xFF))) return -1;
+		} else if (item <= DGR_ITEM_MAX_STRING) {
+			byte value[128];
+			int valueLen = 0;
+			bool escaped = false;
+			while (*p && (*p != ' ' || escaped)) {
+				char chr = *p++;
+				if (chr == '\\' && !escaped) { escaped = true; continue; }
+				escaped = false;
+				if (valueLen >= (int)sizeof(value) - 1) return -1;
+				value[valueLen++] = chr;
+			}
+			value[valueLen++] = 0;
+			if (!MSG_WriteByte(&msg, valueLen) || !MSG_WriteBytes(&msg, value, valueLen)) return -1;
+		} else if (item == DGR_ITEM_LIGHT_CHANNELS) {
+			byte channels[6] = { 0 };
+			int i;
+			bool hex = false;
+			if (*p == '#') { hex = true; p++; }
+			for (i = 0; i < 6 && *p && *p != ' '; i++) {
+				if (hex) {
+					char pair[3];
+					if (!p[1]) return -1;
+					pair[0] = p[0]; pair[1] = p[1]; pair[2] = 0;
+					channels[i] = strtoul(pair, &end, 16);
+					if (end != pair + 2) return -1;
+					p += 2;
+				} else {
+					channels[i] = strtoul(p, &end, 10);
+					if (end == p) return -1;
+					p = end;
+				}
+				if (*p == ',') p++;
+			}
+			if (!MSG_WriteByte(&msg, 6) || !MSG_WriteBytes(&msg, channels, 6)) return -1;
+		} else {
+			return -1;
+		}
+		itemCount++;
+		if (itemCount >= 32) return -1;
+	}
+	if (!itemCount || !MSG_WriteByte(&msg, DGR_ITEM_EOL)) return -1;
 	return msg.position;
 }

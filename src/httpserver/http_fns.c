@@ -3541,6 +3541,14 @@ int http_fn_cfg_dgr(http_request_t* request) {
 			newSendFlags |= DGR_SHARE_LIGHT_COLOR;
 		if (http_getArgInteger(request->url, "r_lcl"))
 			newRecvFlags |= DGR_SHARE_LIGHT_COLOR;
+		if (http_getArgInteger(request->url, "s_lfd")) newSendFlags |= DGR_SHARE_LIGHT_FADE;
+		if (http_getArgInteger(request->url, "r_lfd")) newRecvFlags |= DGR_SHARE_LIGHT_FADE;
+		if (http_getArgInteger(request->url, "s_lsc")) newSendFlags |= DGR_SHARE_LIGHT_SCHEME;
+		if (http_getArgInteger(request->url, "r_lsc")) newRecvFlags |= DGR_SHARE_LIGHT_SCHEME;
+		if (http_getArgInteger(request->url, "s_dim")) newSendFlags |= DGR_SHARE_DIMMER_SETTINGS;
+		if (http_getArgInteger(request->url, "r_dim")) newRecvFlags |= DGR_SHARE_DIMMER_SETTINGS;
+		if (http_getArgInteger(request->url, "s_evt")) newSendFlags |= DGR_SHARE_EVENT;
+		if (http_getArgInteger(request->url, "r_evt")) newRecvFlags |= DGR_SHARE_EVENT;
 
 		CFG_DeviceGroups_SetName(tmpA);
 		CFG_DeviceGroups_SetSendFlags(newSendFlags);
@@ -3591,6 +3599,19 @@ int http_fn_cfg_dgr(http_request_t* request) {
 		if (newSendFlags & DGR_SHARE_LIGHT_COLOR)
 			poststr(request, " checked");
 		poststr(request, "></td> ");
+
+		poststr(request, "</tr><tr><td>Light Fade/Speed</td><td>4</td>");
+		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_lfd\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_lfd\" value=\"1\"%s></td>",
+			(newRecvFlags & DGR_SHARE_LIGHT_FADE) ? " checked" : "", (newSendFlags & DGR_SHARE_LIGHT_FADE) ? " checked" : "");
+		poststr(request, "</tr><tr><td>Light Scheme</td><td>8</td>");
+		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_lsc\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_lsc\" value=\"1\"%s></td>",
+			(newRecvFlags & DGR_SHARE_LIGHT_SCHEME) ? " checked" : "", (newSendFlags & DGR_SHARE_LIGHT_SCHEME) ? " checked" : "");
+		poststr(request, "</tr><tr><td>Dimmer Settings</td><td>32</td>");
+		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_dim\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_dim\" value=\"1\"%s></td>",
+			(newRecvFlags & DGR_SHARE_DIMMER_SETTINGS) ? " checked" : "", (newSendFlags & DGR_SHARE_DIMMER_SETTINGS) ? " checked" : "");
+		poststr(request, "</tr><tr><td>Event</td><td>64</td>");
+		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_evt\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_evt\" value=\"1\"%s></td>",
+			(newRecvFlags & DGR_SHARE_EVENT) ? " checked" : "", (newSendFlags & DGR_SHARE_EVENT) ? " checked" : "");
 
 		poststr(request, "<input type=\"hidden\" name=\"bSet\" value=\"1\">");
 

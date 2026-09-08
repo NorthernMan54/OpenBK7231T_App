@@ -12,6 +12,17 @@ int DGR_GetMemberCountForTest(void);
 int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline);
 
 static int sim_fakeSeq = 1;
+static int dgrTestFade;
+static int dgrTestSpeed;
+static int dgrTestScheme;
+static int dgrTestLow;
+static int dgrTestHigh;
+
+static void DGR_TestFade(byte value) { dgrTestFade = value; }
+static void DGR_TestSpeed(byte value) { dgrTestSpeed = value; }
+static void DGR_TestScheme(byte value) { dgrTestScheme = value; }
+static void DGR_TestLow(byte value) { dgrTestLow = value; }
+static void DGR_TestHigh(byte value) { dgrTestHigh = value; }
 
 static void Test_DeviceGroups_BoundedStrings(void) {
 	bitMessage_t msg;
@@ -104,7 +115,7 @@ static void Test_DeviceGroups_FullStatusFormat(void) {
 
 	len = DGR_Quick_FormatFullStatus(buffer, sizeof(buffer), "status-test", 42,
 		5, 3, DGR_SHARE_POWER | DGR_SHARE_LIGHT_BRI | DGR_SHARE_LIGHT_SCHEME | DGR_SHARE_LIGHT_COLOR,
-		127, 2, rgbcw);
+		0, 127, 2, rgbcw);
 	SELFTEST_ASSERT(len > 0);
 	MSG_BeginReading(&msg, buffer, len);
 	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
@@ -163,6 +174,66 @@ static void Test_DeviceGroups_HeaderOnlyMessages(void) {
 	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 7);
 	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 3);
 	SELFTEST_ASSERT(MSG_EOF(&msg));
+}
+
+static void Test_DeviceGroups_CommandFormatAndExtendedItems(void) {
+	byte buffer[128];
+	bitMessage_t msg;
+	dgrDevice_t device;
+	struct sockaddr_in source;
+	uint32_t noStatusShare = 0;
+	char groupName[32];
+	int len;
+
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "command-test", 55,
+		"3=1 4=9 6=2 8=20 9=80 192=hello\\ world 224=#010203040506");
+	SELFTEST_ASSERT(len > 0);
+	MSG_BeginReading(&msg, buffer, len);
+	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
+	SELFTEST_ASSERT(MSG_ReadString(&msg, groupName, sizeof(groupName)) == 12);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 55);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 0);
+
+	memset(&device, 0, sizeof(device));
+	memset(&source, 0, sizeof(source));
+	strcpy_safe(device.gr.groupName, "command-test", sizeof(device.gr.groupName));
+	device.gr.devGroupShare_In = 0xFFFFFFFF;
+	device.gr.noStatusShare = &noStatusShare;
+	device.cbs.processLightFade = DGR_TestFade;
+	device.cbs.processLightSpeed = DGR_TestSpeed;
+	device.cbs.processLightScheme = DGR_TestScheme;
+	device.cbs.processBrightnessPresetLow = DGR_TestLow;
+	device.cbs.processBrightnessPresetHigh = DGR_TestHigh;
+	dgrTestFade = dgrTestSpeed = dgrTestScheme = dgrTestLow = dgrTestHigh = 0;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
+	SELFTEST_ASSERT(dgrTestFade == 1);
+	SELFTEST_ASSERT(dgrTestSpeed == 9);
+	SELFTEST_ASSERT(dgrTestScheme == 2);
+	SELFTEST_ASSERT(dgrTestLow == 20);
+	SELFTEST_ASSERT(dgrTestHigh == 80);
+}
+
+static void Test_DeviceGroups_NoShareItemFlag(void) {
+	byte buffer[128];
+	dgrDevice_t device;
+	struct sockaddr_in source;
+	uint32_t noStatusShare = 0;
+	int len;
+	memset(&device, 0, sizeof(device));
+	memset(&source, 0, sizeof(source));
+	strcpy_safe(device.gr.groupName, "noshare-test", sizeof(device.gr.groupName));
+	device.gr.devGroupShare_In = DGR_SHARE_LIGHT_BRI;
+	device.gr.noStatusShare = &noStatusShare;
+	device.cbs.processLightBrightness = DGR_TestFade;
+	dgrTestFade = 0;
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 1, "5=N77");
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
+	SELFTEST_ASSERT(dgrTestFade == 0);
+	SELFTEST_ASSERT(noStatusShare & DGR_SHARE_LIGHT_BRI);
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 2, "5=88");
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
+	SELFTEST_ASSERT(dgrTestFade == 88);
+	SELFTEST_ASSERT((noStatusShare & DGR_SHARE_LIGHT_BRI) == 0);
 }
 
 static void Test_DeviceGroups_ACKGroupFiltering(void) {
@@ -361,6 +432,8 @@ void Test_DeviceGroups() {
 	Test_DeviceGroups_TruncatedItems();
 	Test_DeviceGroups_FullStatusFormat();
 	Test_DeviceGroups_HeaderOnlyMessages();
+	Test_DeviceGroups_CommandFormatAndExtendedItems();
+	Test_DeviceGroups_NoShareItemFlag();
 	Test_DeviceGroups_ACKGroupFiltering();
 	Test_DeviceGroups_WrapSafeTimer();
 

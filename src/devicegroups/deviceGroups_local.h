@@ -53,6 +53,8 @@
 #define DGR_ITEM_LAST_ARRAY			225
 #define DGR_ITEM_MAX_ARRAY			255
 
+#define DGR_ITEM_FLAG_NO_SHARE		1
+
 
 
 #define DGR_RELAY_NONE	0
