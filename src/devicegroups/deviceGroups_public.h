@@ -44,5 +44,8 @@ int DGR_Quick_FormatFixedColor(byte *buffer, int maxSize, const char *groupName,
 int DGR_Quick_FormatACK(byte *buffer, int maxSize, const char *groupName, uint16_t sequence);
 int DGR_Quick_FormatAnnouncement(byte *buffer, int maxSize, const char *groupName, uint16_t sequence);
 int DGR_Quick_FormatStatusRequest(byte *buffer, int maxSize, const char *groupName, uint16_t sequence);
+int DGR_Quick_FormatStatusRequestWithFlags(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, int flags);
+int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
+	int relayStates, int numChannels, int shareFlags, byte brightness, byte scheme, const byte *rgbcw);
 
 #endif

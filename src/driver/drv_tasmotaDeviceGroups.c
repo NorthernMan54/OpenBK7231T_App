@@ -22,6 +22,9 @@
   #define portTICK_PERIOD_MS 2
 #endif
 
+#define MAX_DGR_PACKET 128
+#define MAX_DGR_QUEUE_SIZE 8
+
 static const char* dgr_group = "239.255.250.250";
 static int dgr_port = 4447;
 static int dgr_retry_time_left = 5;
@@ -33,30 +36,34 @@ static int g_dgr_stat_sent = 0;
 static int g_dgr_stat_received = 0;
 struct sockaddr_in g_mySockAddr;
 
-static uint16_t g_dgr_send_seq = 0;
+static uint16_t g_dgr_send_seq = 1;
 static uint32_t g_dgr_next_announcement_time = 0;  // Time to send next announcement
 static uint32_t g_dgr_initial_discovery_remaining = 0;  // Count of initial discovery messages to send
+static uint32_t g_dgr_next_discovery_time = 0;
+static uint16_t g_dgr_discovery_sequence = 0;
+static byte g_dgr_reliable_message[MAX_DGR_PACKET];
+static uint16_t g_dgr_reliable_message_length = 0;
+static uint16_t g_dgr_reliable_sequence = 0;
+static uint16_t g_dgr_last_full_status_sequence = 0xFFFF;
+static uint16_t g_dgr_incoming_flags = 0;
+static uint32_t g_dgr_next_ack_check_time = 0;
+static uint32_t g_dgr_member_timeout_time = 0;
+static uint16_t g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+static int g_dgr_retry_member_cursor = 0;
 
 const char *HAL_GetMyIPString();
 
 void DRV_DGR_Dump(byte *message, int len);
+void DRV_DGR_SendFullStatus(const char *groupName);
 
 //
 // A DGR outgoing packets queue mechanism.
 // Used to send all DGR on quick tick 
 // (instead of doing it in-place, from MQTT callback etc)
-//
-// TODO: MUTEX !!!!!
-//
-// Maximum number of bytes in pendings DGR packet
-#define MAX_DGR_PACKET 128
-// limits the total number of dgrPacket_t we can alloc
-#define MAX_DGR_QUEUE_SIZE 8
-
 typedef struct dgrPacket_s {
 	struct dgrPacket_s *next;
 	byte buffer[MAX_DGR_PACKET];
-	byte length;
+	uint16_t length;
 	uint32_t target_ip;  // 0 = multicast, non-zero = unicast to this IP
 } dgrPacket_t;
 
@@ -68,20 +75,23 @@ static SemaphoreHandle_t g_mutex = 0;
 
 // Adds a packet to DGR send queue. Can be called from anywhere, MQTT callback, etc.
 // We don't send UDP DGR packets directly from MQTT callback, because it would crash device in some cases....
-void DGR_AddToSendQueue(byte *data, int len) {
+static bool DGR_AddToSendQueueInternal(byte *data, int len, uint32_t target_ip) {
 	dgrPacket_t *p;
 	bool taken;
-	if(len > MAX_DGR_PACKET) {
-		addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR_AddToSendQueue: DGR packet too long - %i",len);
-		return;
+	if(data == 0 || len <= 0 || len > MAX_DGR_PACKET) {
+		addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR_AddToSendQueue: invalid DGR packet length - %i", len);
+		return false;
 	}	
 	if (g_mutex == 0)
 	{
 		g_mutex = xSemaphoreCreateMutex();
+		if (g_mutex == 0) {
+			return false;
+		}
 	}
 	taken = xSemaphoreTake(g_mutex, 10);
 	if (taken == false) {
-		return;
+		return false;
 	}
 	p = dgr_pending;
 	while(p) {
@@ -94,54 +104,47 @@ void DGR_AddToSendQueue(byte *data, int len) {
 	if(p == 0) {
 		if (dgr_total_alloced_queue_size >= MAX_DGR_QUEUE_SIZE) {
 			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR_AddToSendQueue: DGR queue grew to big, will drop packet");
-			return;
+			xSemaphoreGive(g_mutex);
+			return false;
+		}
+		p = malloc(sizeof(dgrPacket_t));
+		if (p == 0) {
+			xSemaphoreGive(g_mutex);
+			return false;
 		}
 		dgr_total_alloced_queue_size++;
-		p = malloc(sizeof(dgrPacket_t));
-		p->next = dgr_pending;
-		dgr_pending = p;
-	}
-	p->length = len;
-	p->target_ip = 0;  // multicast by default
-	memcpy(p->buffer,data,len);
-	xSemaphoreGive(g_mutex);
-}
-void DGR_AddToUnicastSendQueue(byte *data, int len, uint32_t target_ip) {
-	dgrPacket_t *p;
-	bool taken;
-	if(len > MAX_DGR_PACKET) {
-		addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR_AddToUnicastSendQueue: DGR packet too long - %i",len);
-		return;
-	}
-	if (g_mutex == 0) {
-		g_mutex = xSemaphoreCreateMutex();
-	}
-	taken = xSemaphoreTake(g_mutex, 10);
-	if (taken == false) {
-		return;
-	}
-	p = dgr_pending;
-	while(p) {
-		if(p->length == 0) {
-			break;
-		}
-		p = p->next;
-	}
-	if(p == 0) {
-		if (dgr_total_alloced_queue_size >= MAX_DGR_QUEUE_SIZE) {
-			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR_AddToUnicastSendQueue: DGR queue grew to big, will drop packet");
-			return;
-		}
-		dgr_total_alloced_queue_size++;
-		p = malloc(sizeof(dgrPacket_t));
 		p->next = dgr_pending;
 		dgr_pending = p;
 	}
 	p->length = len;
 	p->target_ip = target_ip;
-	memcpy(p->buffer, data, len);
+	memcpy(p->buffer,data,len);
 	xSemaphoreGive(g_mutex);
+	return true;
 }
+void DGR_AddToSendQueue(byte *data, int len) {
+	DGR_AddToSendQueueInternal(data, len, 0);
+}
+void DGR_AddToUnicastSendQueue(byte *data, int len, uint32_t target_ip) {
+	DGR_AddToSendQueueInternal(data, len, target_ip);
+}
+
+static void DGR_RecordReliableMessage(byte *data, int len, uint16_t sequence) {
+	uint32_t now;
+	if (len <= 0 || len > MAX_DGR_PACKET) {
+		return;
+	}
+	memcpy(g_dgr_reliable_message, data, len);
+	g_dgr_reliable_message_length = len;
+	g_dgr_reliable_sequence = sequence;
+	g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+	now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+	g_dgr_next_ack_check_time = now + g_dgr_ack_check_interval;
+	g_dgr_member_timeout_time = now + DGR_MEMBER_TIMEOUT;
+	g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL;
+	g_dgr_retry_member_cursor = 0;
+}
+
 void DGR_FlushSendQueue() {
 	dgrPacket_t *p;
 	int nbytes;
@@ -150,6 +153,9 @@ void DGR_FlushSendQueue() {
 	if (g_mutex == 0)
 	{
 		g_mutex = xSemaphoreCreateMutex();
+		if (g_mutex == 0) {
+			return;
+		}
 	}
 	taken = xSemaphoreTake(g_mutex, 1);
 	if (taken == false) {
@@ -194,6 +200,29 @@ void DGR_FlushSendQueue() {
 	xSemaphoreGive(g_mutex);
 
 }
+
+#if WINDOWS
+int DGR_GetPendingPacketCountForTest(void) {
+	dgrPacket_t *p;
+	int count = 0;
+	bool taken;
+	if (g_mutex == 0) {
+		return 0;
+	}
+	taken = xSemaphoreTake(g_mutex, 10);
+	if (taken == false) {
+		return -1;
+	}
+	for (p = dgr_pending; p; p = p->next) {
+		if (p->length != 0) {
+			count++;
+		}
+	}
+	xSemaphoreGive(g_mutex);
+	return count;
+}
+
+#endif
 byte Val255ToVal100(byte v){ 
 	float fr;
 	// convert to our 0-100 range
@@ -216,18 +245,31 @@ void DRV_DGR_CreateSocket_Send() {
     }
 	addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DRV_DGR_CreateSocket_Send: socket created");
 }
-void DRV_DGR_Send_Generic(byte *message, int len) {
+void DRV_DGR_Send_Generic(byte *message, int len, const char *groupName) {
 	// if this send is as a result of use RXing something, 
 	// don't send it....
-	if (g_inCmdProcessing){
+	if (g_inCmdProcessing || g_dgr_initial_discovery_remaining){
+		return;
+	}
+	if (g_dgr_reliable_message_length && groupName
+		&& strcmp(groupName, CFG_DeviceGroups_GetName()) == 0) {
+		// Tasmota merges new state into an unacknowledged update. A fresh full-status
+		// packet provides the same convergence guarantee with this simpler formatter.
+		DRV_DGR_SendFullStatus(groupName);
 		return;
 	}
 
-	g_dgr_send_seq++;
-
 	// This is here only because sending UDP from MQTT callback crashes BK for me
 	// So instead, we are making a queue which is sent in quick tick
-	DGR_AddToSendQueue(message, len);
+	if (DGR_AddToSendQueueInternal(message, len, 0)) {
+		if (groupName && strcmp(groupName, CFG_DeviceGroups_GetName()) == 0) {
+			DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
+		}
+		g_dgr_send_seq++;
+		if (g_dgr_send_seq == 0) {
+			g_dgr_send_seq = 1;
+		}
+	}
 	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR adds to queue %i",len);
 }
 
@@ -253,7 +295,7 @@ void DRV_DGR_Send_Power(const char *groupName, int channelValues, int numChannel
 
 	len = DGR_Quick_FormatPowerState(message,sizeof(message),groupName,g_dgr_send_seq, 0,channelValues, numChannels);
 
-	DRV_DGR_Send_Generic(message,len);
+	DRV_DGR_Send_Generic(message,len,groupName);
 }
 void DRV_DGR_Send_Brightness(const char *groupName, byte brightness){
 	int len;
@@ -266,7 +308,7 @@ void DRV_DGR_Send_Brightness(const char *groupName, byte brightness){
 
 	len = DGR_Quick_FormatBrightness(message,sizeof(message),groupName,g_dgr_send_seq, 0, brightness);
 
-	DRV_DGR_Send_Generic(message,len);
+	DRV_DGR_Send_Generic(message,len,groupName);
 }
 void DRV_DGR_Send_RGBCW(const char *groupName, byte *rgbcw){
 	int len;
@@ -279,7 +321,7 @@ void DRV_DGR_Send_RGBCW(const char *groupName, byte *rgbcw){
 
 	len = DGR_Quick_FormatRGBCW(message,sizeof(message),groupName,g_dgr_send_seq, 0, rgbcw[0],rgbcw[1],rgbcw[2],rgbcw[3],rgbcw[4]);
 
-	DRV_DGR_Send_Generic(message,len);
+	DRV_DGR_Send_Generic(message,len,groupName);
 }
 void DRV_DGR_Send_FixedColor(const char *groupName, int colorIndex) {
 	int len;
@@ -292,7 +334,7 @@ void DRV_DGR_Send_FixedColor(const char *groupName, int colorIndex) {
 
 	len = DGR_Quick_FormatFixedColor(message, sizeof(message), groupName, g_dgr_send_seq, 0, colorIndex);
 
-	DRV_DGR_Send_Generic(message, len);
+	DRV_DGR_Send_Generic(message, len, groupName);
 }
 
 // Send announcement message (heartbeat)
@@ -306,20 +348,7 @@ void DRV_DGR_SendAnnouncement(const char *groupName) {
 	// Don't increment sequence for announcements (they use current sequence)
 	// But we still queue them
 	DGR_AddToSendQueue(message, len);
-	g_dgr_send_seq++;  // Increment after announcement
 	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DRV_DGR_SendAnnouncement: Sent announcement for group %s", groupName);
-}
-
-// Send status request (discovery/rediscovery)
-void DRV_DGR_SendStatusRequest(const char *groupName) {
-	int len;
-	byte message[64];
-	
-	len = DGR_Quick_FormatStatusRequest(message, sizeof(message), groupName, g_dgr_send_seq);
-	
-	DGR_AddToSendQueue(message, len);
-	g_dgr_send_seq++;
-	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DRV_DGR_SendStatusRequest: Sent status request for group %s", groupName);
 }
 
 void DRV_DGR_CreateSocket_Receive() {
@@ -469,13 +498,18 @@ typedef struct dgrMmember_s {
 	int ip;
 	uint16_t lastSeq;
 	uint16_t acked_sequence;			// Last sequence we received ACK for
-	uint32_t last_heard_time;			// Timestamp of last message from this member (for timeout)
 } dgrMember_t;
 
 #define MAX_DGR_MEMBERS 32
 static dgrMember_t g_dgrMembers[MAX_DGR_MEMBERS];
 static int g_curDGRMembers = 0;
 static struct sockaddr_in addr;
+
+#if WINDOWS
+int DGR_GetMemberCountForTest(void) {
+	return g_curDGRMembers;
+}
+#endif
 
 dgrMember_t *findMember() {
 	int i, ip;
@@ -494,7 +528,6 @@ dgrMember_t *findMember() {
 	g_dgrMembers[i].ip = ip;
 	g_dgrMembers[i].lastSeq = 0;
 	g_dgrMembers[i].acked_sequence = 0;
-	g_dgrMembers[i].last_heard_time = xTaskGetTickCount() / portTICK_PERIOD_MS;  // Current time in ms
 	return &g_dgrMembers[i];
 }
 
@@ -509,26 +542,16 @@ int DGR_CheckSequence(uint16_t seq) {
 	}
 	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_CheckSequence: argument %i, last %i",(int)seq, (int)m->lastSeq);
 	
-	// Update last heard time - this member is alive
-	m->last_heard_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
-	
-	// make it work past wrap at
-	if((seq > m->lastSeq) || (seq+10 > m->lastSeq+10)) {
-		if(seq != (m->lastSeq+1)){
-			//addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"Seq for %s skip %i->%i",inet_ntoa(m->ip), m->lastSeq, seq);
+	// Match Tasmota v9.5.0 duplicate detection, including uint16 wrap-around.
+	if (seq <= m->lastSeq) {
+		if (seq == m->lastSeq || (uint16_t)(m->lastSeq - seq) > 64536) {
+			addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq failed");
+			return 1;
 		}
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq ok");
-		m->lastSeq = seq;
-		return 0;
 	}
-	if(seq + 16 < m->lastSeq) {
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq Hard reset");
-		// hard reset
-		m->lastSeq = seq;
-		return 0;
-	}
-	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq failed");
-	return 1;
+	m->lastSeq = seq;
+	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq ok");
+	return 0;
 }
 
 void DGR_HandleIncomingACK(uint16_t seq) {
@@ -541,13 +564,34 @@ void DGR_HandleIncomingACK(uint16_t seq) {
 		m->acked_sequence = seq;
 		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_HandleIncomingACK: member ACK'd our sequence %u", seq);
 	}
-	m->last_heard_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
 }
+
+static bool DGR_TimeReached(uint32_t now, uint32_t deadline) {
+	return (int32_t)(now - deadline) >= 0;
+}
+
+static void DGR_StartDiscovery(void) {
+	uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+	g_dgr_initial_discovery_remaining = 10;
+	g_dgr_discovery_sequence = g_dgr_send_seq++;
+	if (g_dgr_send_seq == 0) {
+		g_dgr_send_seq = 1;
+	}
+	g_dgr_next_discovery_time = now + DGR_DISCOVERY_START_DELAY;
+	g_dgr_next_announcement_time = 0xFFFFFFFF;
+	g_dgr_reliable_message_length = 0;
+	g_dgr_next_ack_check_time = 0;
+}
+
+#if WINDOWS
+int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline) {
+	return DGR_TimeReached(now, deadline);
+}
+#endif
 
 void DRV_DGR_RunEverySecond() {
 	const char *myip;
 	uint32_t now;
-	int i;
 	const char *groupName;
 
 	// TODO: do it only on IP change?
@@ -560,18 +604,18 @@ void DRV_DGR_RunEverySecond() {
 
 		if(dgr_retry_time_left <= 0){
 			dgr_retry_time_left = 5;
-			if(g_dgr_socket_receive <= 0){
-				DRV_DGR_CreateSocket_Receive();
-				// On socket creation, send initial discovery messages
-				groupName = CFG_DeviceGroups_GetName();
-				if(groupName && groupName[0]) {
-					g_dgr_initial_discovery_remaining = 10;  // Send 10 discovery requests
-					g_dgr_next_announcement_time = 0;  // Send first one immediately
+				if(g_dgr_socket_receive <= 0){
+					DRV_DGR_CreateSocket_Receive();
 				}
-			}
-			if(g_dgr_socket_send <= 0){
-				DRV_DGR_CreateSocket_Send();
-			}
+				if(g_dgr_socket_send <= 0){
+					DRV_DGR_CreateSocket_Send();
+				}
+				if (g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) {
+					groupName = CFG_DeviceGroups_GetName();
+					if(groupName && groupName[0]) {
+						DGR_StartDiscovery();
+					}
+				}
 		}
 		return;
 	}
@@ -582,30 +626,12 @@ void DRV_DGR_RunEverySecond() {
 		return;  // No group configured
 	}
 
-	// Send initial status request messages for discovery
 	if(g_dgr_initial_discovery_remaining > 0) {
-		DRV_DGR_SendStatusRequest(groupName);
-		g_dgr_initial_discovery_remaining--;
-		return;  // Only send one per second during discovery phase
-	}
-
-	// Check for member timeouts
-	for(i = 0; i < g_curDGRMembers; i++) {
-		uint32_t elapsed = now - g_dgrMembers[i].last_heard_time;
-		if(elapsed > DGR_MEMBER_TIMEOUT) {
-			// Member has timed out - remove it
-			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "Member at index %i timed out after %lu ms", i, elapsed);
-			// Shift remaining members down
-			if(i < g_curDGRMembers - 1) {
-				memmove(&g_dgrMembers[i], &g_dgrMembers[i+1], (g_curDGRMembers - i - 1) * sizeof(dgrMember_t));
-			}
-			g_curDGRMembers--;
-			i--;  // Recheck this position
-		}
+		return;
 	}
 
 	// Send periodic announcements (heartbeat every DGR_ANNOUNCEMENT_INTERVAL ms)
-	if(now >= g_dgr_next_announcement_time) {
+	if(DGR_TimeReached(now, g_dgr_next_announcement_time)) {
 		DRV_DGR_SendAnnouncement(groupName);
 		// Schedule next announcement with random jitter (60-70 seconds)
 		g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL + (rand() % 10000);
@@ -619,27 +645,153 @@ void DGR_SpoofNextDGRPacketSource(const char *ipStrs) {
 	addr.sin_port = htons(dgr_port);
 }
 
-void DRV_DGR_SendFullStatus(const char *groupName, uint32_t target_ip) {
+void DRV_DGR_SendFullStatus(const char *groupName) {
 	byte message[128];
+	byte rgbcw[5] = { 0 };
 	int len;
-	int relayStates;
-	int numChannels = 1;
+	int relayStates = 0;
+	int numChannels = 0;
+	int startIndex;
+	int shareFlags = CFG_DeviceGroups_GetSendFlags();
+	byte brightness = 0;
+	byte scheme = 0;
+	int i;
+	if (g_dgr_initial_discovery_remaining) {
+		return;
+	}
 
-	// Read current channel 1 state (1-based index)
-	relayStates = CHANNEL_Get(1);
+#if ENABLE_LED_BASIC
+	if(PIN_CountPinsWithRoleOrRole(IOR_PWM, IOR_PWM_n) > 0 || LED_IsLedDriverChipRunning()) {
+		relayStates = LED_GetEnableAll() ? 1 : 0;
+		numChannels = 1;
+		brightness = Val100ToVal255(LED_GetDimmer());
+		scheme = LED_GetMode();
+		LED_GetFinalRGBCW(rgbcw);
+	} else
+#endif
+	{
+		if (CHANNEL_HasChannelPinWithRoleOrRole(0, IOR_Relay, IOR_Relay_n)
+			|| CHANNEL_HasChannelPinWithRoleOrRole(0, IOR_LED, IOR_LED_n)) {
+			startIndex = 0;
+		} else {
+			startIndex = 1;
+		}
+		for (i = 0; i < CHANNEL_MAX - startIndex && i < 24; i++) {
+			int ch = i + startIndex;
+			if (CHANNEL_HasChannelPinWithRoleOrRole(ch, IOR_Relay, IOR_Relay_n)
+				|| CHANNEL_HasChannelPinWithRoleOrRole(ch, IOR_LED, IOR_LED_n)) {
+				numChannels = i + 1;
+				if (CHANNEL_Get(ch)) {
+					relayStates |= (1 << i);
+				}
+			}
+		}
+	}
 
-	len = DGR_Quick_FormatPowerState(message, sizeof(message), groupName,
-	                                 g_dgr_send_seq, DGR_FLAG_FULL_STATUS,
-	                                 relayStates, numChannels);
-	if (len > 0) {
-		DGR_AddToUnicastSendQueue(message, len, target_ip);
+	len = DGR_Quick_FormatFullStatus(message, sizeof(message), groupName, g_dgr_send_seq,
+		relayStates, numChannels, shareFlags, brightness, scheme, rgbcw);
+	if (len > 0 && DGR_AddToSendQueueInternal(message, len, 0)) {
+		// Tasmota multicasts full status so every member can refresh its view.
+		DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
+		g_dgr_last_full_status_sequence = g_dgr_send_seq;
 		g_dgr_send_seq++;
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DRV_DGR_SendFullStatus: sent full status to requester");
+		if (g_dgr_send_seq == 0) {
+			g_dgr_send_seq = 1;
+		}
+		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DRV_DGR_SendFullStatus: multicast full status");
 	}
 }
 
 static void DRV_DGR_SendFullStatus_Callback(void) {
-	DRV_DGR_SendFullStatus(CFG_DeviceGroups_GetName(), addr.sin_addr.s_addr);
+	dgrMember_t *member = findMember();
+	if ((g_dgr_incoming_flags & DGR_FLAG_RESET) || member == 0
+		|| member->acked_sequence != g_dgr_last_full_status_sequence) {
+		DRV_DGR_SendFullStatus(CFG_DeviceGroups_GetName());
+	}
+}
+
+static void DGR_RunDiscovery(uint32_t now) {
+	byte message[64];
+	const char *groupName;
+	int flags;
+	int len;
+
+	if (!g_dgr_initial_discovery_remaining || !DGR_TimeReached(now, g_dgr_next_discovery_time)) {
+		return;
+	}
+	groupName = CFG_DeviceGroups_GetName();
+	flags = DGR_FLAG_STATUS_REQUEST;
+	if (g_dgr_initial_discovery_remaining == 10) {
+		flags |= DGR_FLAG_RESET;
+	}
+	len = DGR_Quick_FormatStatusRequestWithFlags(message, sizeof(message), groupName,
+		g_dgr_discovery_sequence, flags);
+	if (!DGR_AddToSendQueueInternal(message, len, 0)) {
+		g_dgr_next_discovery_time = now + DGR_DISCOVERY_INTERVAL;
+		return;
+	}
+	g_dgr_initial_discovery_remaining--;
+	if (g_dgr_initial_discovery_remaining) {
+		g_dgr_next_discovery_time = now + DGR_DISCOVERY_INTERVAL;
+	} else {
+		uint16_t fullStatusSequence = g_dgr_send_seq;
+		DRV_DGR_SendFullStatus(groupName);
+		if (g_dgr_last_full_status_sequence != fullStatusSequence) {
+			g_dgr_initial_discovery_remaining = 1;
+			g_dgr_next_discovery_time = now + DGR_DISCOVERY_INTERVAL;
+		}
+	}
+}
+
+static void DGR_RunReliability(uint32_t now) {
+	bool allAcked = true;
+	int memberCount;
+	int startCursor;
+	int visited;
+	int i;
+
+	if (!g_dgr_reliable_message_length || !g_dgr_next_ack_check_time
+		|| !DGR_TimeReached(now, g_dgr_next_ack_check_time)) {
+		return;
+	}
+	if (DGR_TimeReached(now, g_dgr_member_timeout_time)) {
+		for (i = 0; i < g_curDGRMembers; i++) {
+			if (g_dgrMembers[i].acked_sequence == g_dgr_reliable_sequence) {
+				continue;
+			}
+			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DGR member at index %i removed after ACK timeout", i);
+			if (i < g_curDGRMembers - 1) {
+				memmove(&g_dgrMembers[i], &g_dgrMembers[i + 1],
+					(g_curDGRMembers - i - 1) * sizeof(dgrMember_t));
+			}
+			g_curDGRMembers--;
+			i--;
+		}
+		g_dgr_retry_member_cursor = 0;
+	}
+	memberCount = g_curDGRMembers;
+	startCursor = g_dgr_retry_member_cursor;
+	for (visited = 0; visited < memberCount; visited++) {
+		i = (startCursor + visited) % memberCount;
+		if (g_dgrMembers[i].acked_sequence != g_dgr_reliable_sequence) {
+			allAcked = false;
+			if (!DGR_AddToSendQueueInternal(g_dgr_reliable_message,
+				g_dgr_reliable_message_length, g_dgrMembers[i].ip)) {
+				break;
+			}
+			g_dgr_retry_member_cursor = (i + 1) % memberCount;
+		}
+	}
+	if (allAcked) {
+		g_dgr_reliable_message_length = 0;
+		g_dgr_next_ack_check_time = 0;
+	} else {
+		g_dgr_ack_check_interval *= 2;
+		if (g_dgr_ack_check_interval > DGR_ACK_MAX_INTERVAL) {
+			g_dgr_ack_check_interval = DGR_ACK_MAX_INTERVAL;
+		}
+		g_dgr_next_ack_check_time = now + g_dgr_ack_check_interval;
+	}
 }
 
 void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
@@ -649,7 +801,10 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	uint16_t sequence;
 	uint16_t flags;
 
-	if (nbytes >= 0 && nbytes < 128) {
+	if (msgbuf == 0 || nbytes <= 0 || nbytes >= 128) {
+		return;
+	}
+	if (nbytes < 128) {
 		msgbuf[nbytes] = '\0';
 	}
 
@@ -661,16 +816,28 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	if(MSG_ReadString(&msg, groupName, sizeof(groupName)) <= 0) {
 		return;  // Failed to read group name
 	}
+	if (msg.position + 4 > nbytes) {
+		return;  // Missing sequence or flags
+	}
 	sequence = MSG_ReadU16(&msg);
 	flags = MSG_ReadU16(&msg);
+	g_dgr_incoming_flags = flags;
+	if(strcmp(groupName, CFG_DeviceGroups_GetName()) != 0) {
+		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_ProcessIncomingPacket: Ignoring packet for group '%s' (ours is '%s')", groupName, CFG_DeviceGroups_GetName());
+		return;
+	}
+	if (findMember() == 0) {
+		return;
+	}
 
 	// Intercept ACKs before DGR_Parse — update acked_sequence only, never lastSeq
-	if (flags & DGR_FLAG_ACK) {
+	if (flags == DGR_FLAG_ACK) {
 		DGR_HandleIncomingACK(sequence);
 		return;
 	}
 
-	strcpy(def.gr.groupName, CFG_DeviceGroups_GetName());
+	memset(&def, 0, sizeof(def));
+	strcpy_safe(def.gr.groupName, CFG_DeviceGroups_GetName(), sizeof(def.gr.groupName));
 	def.gr.devGroupShare_In = CFG_DeviceGroups_GetRecvFlags();
 	def.gr.devGroupShare_Out = CFG_DeviceGroups_GetSendFlags();
 #if ENABLE_LED_BASIC
@@ -688,17 +855,13 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 #ifdef DGRLOADMOREDEBUG	
 	DRV_DGR_Dump((byte*)msgbuf, nbytes);
 #endif
-	DGR_Parse((byte*)msgbuf, nbytes, &def, (struct sockaddr *)&addr);
-	
-	// Only ACK messages for our configured group - ignore other groups on the multicast bus
-	if(strcasecmp(groupName, CFG_DeviceGroups_GetName()) != 0) {
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_ProcessIncomingPacket: Ignoring packet for group '%s' (ours is '%s')", groupName, CFG_DeviceGroups_GetName());
+	if (DGR_Parse((byte*)msgbuf, nbytes, &def, (struct sockaddr *)&addr) < 0) {
 		g_inCmdProcessing = 0;
 		return;
 	}
 
-	// Send ACK for normal messages (not ACK, not ANNOUNCEMENT, not STATUS_REQUEST, not MORE_TO_COME)
-	if(!(flags & DGR_FLAG_ACK) && !(flags & DGR_FLAG_ANNOUNCEMENT) && !(flags & DGR_FLAG_STATUS_REQUEST) && !(flags & DGR_FLAG_MORE_TO_COME)) {
+	// Exact ACKs returned above; Tasmota ACKs every other received message except announcements and partial packets.
+	if(flags != DGR_FLAG_ANNOUNCEMENT && !(flags & DGR_FLAG_MORE_TO_COME)) {
 		byte ackBuffer[64];
 		int ackLen = DGR_Quick_FormatACK(ackBuffer, sizeof(ackBuffer), groupName, sequence);
 		if(ackLen > 0) {
@@ -719,6 +882,11 @@ void DRV_DGR_RunQuickTick() {
 
 	if(g_dgr_socket_receive<=0 || g_dgr_socket_send <= 0) {
 		return ;
+	}
+	{
+		uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+		DGR_RunDiscovery(now);
+		DGR_RunReliability(now);
 	}
     // send pending
 	DGR_FlushSendQueue();
@@ -772,9 +940,16 @@ void DRV_DGR_Shutdown()
 	}
 	dgr_retry_time_left = 5;
 	g_inCmdProcessing = 0;
-	g_dgr_send_seq = 0;
+	g_dgr_send_seq = 1;
 	g_dgr_next_announcement_time = 0;
 	g_dgr_initial_discovery_remaining = 0;
+	g_dgr_next_discovery_time = 0;
+	g_dgr_discovery_sequence = 0;
+	g_dgr_reliable_message_length = 0;
+	g_dgr_next_ack_check_time = 0;
+	g_dgr_last_full_status_sequence = 0xFFFF;
+	g_dgr_incoming_flags = 0;
+	g_dgr_retry_member_cursor = 0;
 }
 
 void DRV_DGR_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreState) {
@@ -1005,8 +1180,17 @@ void DRV_DGR_Init()
 {
 	memset(&g_dgrMembers[0],0,sizeof(g_dgrMembers));
 	g_curDGRMembers = 0;
+	g_dgr_send_seq = 1;
 	g_dgr_next_announcement_time = 0;
 	g_dgr_initial_discovery_remaining = 0;
+	g_dgr_next_discovery_time = 0;
+	g_dgr_reliable_message_length = 0;
+	g_dgr_next_ack_check_time = 0;
+	g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+	g_dgr_member_timeout_time = 0;
+	g_dgr_last_full_status_sequence = 0xFFFF;
+	g_dgr_incoming_flags = 0;
+	g_dgr_retry_member_cursor = 0;
 
 	DRV_DGR_CreateSocket_Receive();
 	DRV_DGR_CreateSocket_Send();
@@ -1015,8 +1199,7 @@ void DRV_DGR_Init()
 	if (g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) {
 		const char *groupName = CFG_DeviceGroups_GetName();
 		if (groupName && groupName[0]) {
-			g_dgr_initial_discovery_remaining = 10;
-			g_dgr_next_announcement_time = 0xFFFFFFFF;  // Don't send announcement until discovery done
+			DGR_StartDiscovery();
 			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DRV_DGR_Init: Starting initial discovery (10 requests)");
 		}
 	}
@@ -1042,4 +1225,3 @@ void DRV_DGR_Init()
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("DGR_SendFixedColor", CMD_DGR_SendFixedColor, NULL);
 }
-

@@ -20,18 +20,22 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 
 	if(MSG_CheckAndSkip(&msg,TASMOTA_DEVICEGROUPS_HEADER,strlen(TASMOTA_DEVICEGROUPS_HEADER))==0) {
 		addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DGR_Parse: data chunk with len %i had bad header",len);
-		return 1;
+		return -2;
 	}
 	if(MSG_ReadString(&msg,groupName,sizeof(groupName)) <= 0) {
 		addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DGR_Parse: data chunk with len %i failed to read group name",len);
-		return 1;
+		return -2;
+	}
+	if (msg.position + 4 > len) {
+		addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DGR_Parse: data chunk with len %i is missing sequence or flags",len);
+		return -2;
 	}
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DGR_Parse: grp name %s len %d", groupName, strlen(groupName));
 
 	if(dev != 0) {
 		// right now, only single group support
-		if(strcasecmp(dev->gr.groupName,groupName)) {
+		if(strcmp(dev->gr.groupName,groupName)) {
 			addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR,"DGR ignoring message from group %s - device is in %s",groupName,dev->gr.groupName);
 			return -1;
 		}
@@ -42,28 +46,21 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 	addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DGR_Parse: [%s] seq 0x%04X, flags 0x%02X",inet_ntoa(((struct sockaddr_in *)addr)->sin_addr),sequence, flags);
 
 	// Handle ANNOUNCEMENT message - just a heartbeat, update member but don't process
-	if(flags & DGR_FLAG_ANNOUNCEMENT) {
+	if(flags == DGR_FLAG_ANNOUNCEMENT) {
 		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_Parse: Received ANNOUNCEMENT from device");
-		// Member is tracked via checkSequence call
-		if(dev && dev->cbs.checkSequence(sequence)) {
-			return 1;  // Reject if old sequence
-		}
-		return 0;  // Accept announcement as valid (member was found/updated)
+		return 0;
 	}
 
 	// Handle STATUS_REQUEST - we should respond with our full status
 	if(flags & DGR_FLAG_STATUS_REQUEST) {
 		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_Parse: Received STATUS_REQUEST from device");
-		if(dev && dev->cbs.checkSequence(sequence)) {
-			return 1;  // Reject if old sequence
-		}
 		if (dev && dev->cbs.sendFullStatus) {
 			dev->cbs.sendFullStatus();
 		}
 		return 0;
 	}
 
-	if(dev && dev->cbs.checkSequence(sequence)) {
+	if(dev && dev->cbs.checkSequence && dev->cbs.checkSequence(sequence)) {
 		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR,"DGR ignoring message from duplicate or older sequence %i",sequence);
 		return 1;
 	}
@@ -74,12 +71,15 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 		if(type == DGR_ITEM_EOL) {
 			bGotEOL = 1;
 		} else if(type < DGR_ITEM_MAX_8BIT) {
+			if (msg.position + 1 > msg.totalSize) {
+				return -2;
+			}
 			vals = MSG_ReadByte(&msg);
 			if(type == DGR_ITEM_BRI_POWER_ON) {
 				addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DGR_ITEM_BRI_POWER_ON: %i",vals);
 				// FORWARD TO PROCESSING BY API
 				if(dev) {
-					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In)) {
+					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In) && dev->cbs.processBrightnessPowerOn) {
 						dev->cbs.processBrightnessPowerOn(vals);
 					}
 				}
@@ -87,7 +87,7 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DGR_ITEM_LIGHT_BRI: %i",vals);
 				// FORWARD TO PROCESSING BY API
 				if(dev) {
-					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In)) {
+					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In) && dev->cbs.processLightBrightness) {
 						dev->cbs.processLightBrightness(vals);
 					}
 				}
@@ -96,7 +96,7 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR, "DGR_ITEM_LIGHT_FIXED_COLOR: %i", vals);
 				// FORWARD TO PROCESSING BY API
 				if (dev) {
-					if (DGR_IsItemInMask(type, dev->gr.devGroupShare_In)) {
+					if (DGR_IsItemInMask(type, dev->gr.devGroupShare_In) && dev->cbs.processLightFixedColor) {
 						dev->cbs.processLightFixedColor(vals);
 					}
 				}
@@ -104,16 +104,24 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				
 			}
 		} else if(type < DGR_ITEM_MAX_16BIT) {
-			MSG_SkipBytes(&msg,2);
+			if (MSG_SkipBytes(&msg, 2) == 0) {
+				return -2;
+			}
 		} else if(type < DGR_ITEM_MAX_32BIT) {
+			if (msg.position + 4 > msg.totalSize) {
+				return -2;
+			}
 			if(type == DGR_ITEM_POWER) {
 
 				relayFlags = MSG_Read3Bytes(&msg);
 				relaysCnt = MSG_ReadByte(&msg);
+				if (relaysCnt > 24) {
+					return -2;
+				}
 
 				// FORWARD TO PROCESSING BY API
 				if(dev) {
-					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In)) {
+					if(DGR_IsItemInMask(type, dev->gr.devGroupShare_In) && dev->cbs.processPower) {
 						dev->cbs.processPower(relayFlags,relaysCnt);
 					}
 				}
@@ -131,16 +139,28 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				MSG_SkipBytes(&msg,4);
 			}
 		} else if(type < DGR_ITEM_MAX_STRING) {
+			if (msg.position + 1 > msg.totalSize) {
+				return -2;
+			}
 			byte sLen = MSG_ReadByte(&msg);
+			if (msg.position + sLen > msg.totalSize) {
+				return -2;
+			}
 			// DevGroupSend 193=Tst
 			// Gives sLen 4
 			if(type == DGR_ITEM_COMMAND) {
 				const char *cmd = MSG_GetStringPointerAtCurrentPosition(&msg);
-				addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DGR_ITEM_COMMAND: %s",cmd);
+				addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DGR_ITEM_COMMAND: %.*s", (int)sLen, cmd);
 			}
 			MSG_SkipBytes(&msg,sLen);
 		} else if(type == DGR_ITEM_LIGHT_CHANNELS) {
+			if (msg.position + 1 > msg.totalSize) {
+				return -2;
+			}
 			byte sLen = MSG_ReadByte(&msg);
+			if (msg.position + sLen > msg.totalSize) {
+				return -2;
+			}
 			// array of channels.
 			// process as many as we find
 			// note: from TAS h801, I get 6?!!
@@ -167,14 +187,21 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				if ((count == 5) || (count == 6)){
 
 				}
-				dev->cbs.processRGBCW(dat);
+				if (dev && dev->cbs.processRGBCW) {
+					dev->cbs.processRGBCW(dat);
+				}
 			}
 			// skip any remaining from array.
 			MSG_SkipBytes(&msg,sLen);
 			
 		} else {
+			if (msg.position + 1 > msg.totalSize) {
+				return -2;
+			}
 			byte sLen = MSG_ReadByte(&msg);
-			MSG_SkipBytes(&msg,sLen);
+			if (MSG_SkipBytes(&msg, sLen) == 0 && sLen != 0) {
+				return -2;
+			}
 		}
 		if(bGotEOL) {
 			break;

@@ -2,14 +2,6 @@
 #include "../new_common.h"
 #include "deviceGroups_public.h"
 
-// Windows/MSVC compatibility: map POSIX string functions to Windows equivalents
-#if defined(_WIN32) && !defined(strcasecmp)
-#define strcasecmp _stricmp
-#endif
-#if defined(_WIN32) && !defined(strncasecmp)
-#define strncasecmp _strnicmp
-#endif
-
 #define TASMOTA_DEVICEGROUPS_HEADER "TASMOTA_DGR"
 
 // Device Group Message Flags (must match Tasmota)
@@ -22,9 +14,13 @@
 #define DGR_FLAG_ANNOUNCEMENT		64
 #define DGR_FLAG_LOCAL				128
 
-// Timeouts and intervals (must match Tasmota)
-#define DGR_MEMBER_TIMEOUT			45000  // 45 seconds in milliseconds
+// Tasmota v9.5.0 reliability and announcement timings
+#define DGR_MEMBER_TIMEOUT			45000
 #define DGR_ANNOUNCEMENT_INTERVAL	60000  // 60 seconds in milliseconds
+#define DGR_ACK_INITIAL_INTERVAL		200
+#define DGR_ACK_MAX_INTERVAL			5000
+#define DGR_DISCOVERY_START_DELAY	2000
+#define DGR_DISCOVERY_INTERVAL		200
 
 #define DGR_ITEM_EOL				0
 #define DGR_ITEM_STATUS				1
@@ -91,6 +87,3 @@
 
 unsigned int DGR_GetMaskForItem(byte item);
 int DGR_IsItemInMask(byte item, unsigned int mask);
-
-
-

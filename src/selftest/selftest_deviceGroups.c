@@ -3,8 +3,196 @@
 #include "selftest_local.h"
 #include "../driver/drv_local.h"
 #include "../devicegroups/deviceGroups_public.h"
+#include "../bitmessage/bitmessage_public.h"
+
+void DGR_AddToSendQueue(byte *data, int len);
+void DGR_FlushSendQueue(void);
+int DGR_GetPendingPacketCountForTest(void);
+int DGR_GetMemberCountForTest(void);
+int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline);
 
 static int sim_fakeSeq = 1;
+
+static void Test_DeviceGroups_BoundedStrings(void) {
+	bitMessage_t msg;
+	byte valid[] = { 'g', 'r', 'p', 0 };
+	byte tooLong[] = { '1', '2', '3', '4', '5', 0 };
+	byte unterminated[] = { 'b', 'a', 'd' };
+	char output[5];
+
+	MSG_BeginReading(&msg, valid, sizeof(valid));
+	SELFTEST_ASSERT(MSG_ReadString(&msg, output, sizeof(output)) == 3);
+	SELFTEST_ASSERT(strcmp(output, "grp") == 0);
+
+	MSG_BeginReading(&msg, tooLong, sizeof(tooLong));
+	SELFTEST_ASSERT(MSG_ReadString(&msg, output, sizeof(output)) == -1);
+	SELFTEST_ASSERT(output[0] == 0);
+
+	MSG_BeginReading(&msg, unterminated, sizeof(unterminated));
+	SELFTEST_ASSERT(MSG_ReadString(&msg, output, sizeof(output)) == -1);
+	SELFTEST_ASSERT(output[0] == 0);
+}
+
+static void Test_DeviceGroups_TruncatedItems(void) {
+	byte buffer[64];
+	bitMessage_t msg;
+	dgrDevice_t device;
+	struct sockaddr_in source;
+	int len;
+
+	memset(&device, 0, sizeof(device));
+	memset(&source, 0, sizeof(source));
+	strcpy_safe(device.gr.groupName, "parse-test", sizeof(device.gr.groupName));
+
+	MSG_BeginWriting(&msg, buffer, sizeof(buffer));
+	MSG_WriteBytes(&msg, "TASMOTA_DGR", 11);
+	MSG_WriteString(&msg, "parse-test");
+	MSG_WriteU16(&msg, 1);
+	MSG_WriteU16(&msg, 0);
+	MSG_WriteByte(&msg, 128); /* DGR_ITEM_POWER without its four-byte value */
+	len = msg.position;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == -2);
+
+	MSG_BeginWriting(&msg, buffer, sizeof(buffer));
+	MSG_WriteBytes(&msg, "TASMOTA_DGR", 11);
+	MSG_WriteString(&msg, "parse-test");
+	MSG_WriteU16(&msg, 2);
+	MSG_WriteU16(&msg, 0);
+	MSG_WriteByte(&msg, 193); /* DGR_ITEM_COMMAND */
+	MSG_WriteByte(&msg, 10);  /* Declared data is longer than the packet. */
+	MSG_WriteByte(&msg, 'x');
+	len = msg.position;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == -2);
+
+	MSG_BeginWriting(&msg, buffer, sizeof(buffer));
+	MSG_WriteBytes(&msg, "TASMOTA_DGR", 11);
+	MSG_WriteString(&msg, "parse-test");
+	MSG_WriteU16(&msg, 3);
+	MSG_WriteU16(&msg, 0);
+	MSG_WriteByte(&msg, 128); /* DGR_ITEM_POWER */
+	MSG_Write3Bytes(&msg, 0);
+	MSG_WriteByte(&msg, 25);  /* Power payload contains only 24 state bits. */
+	MSG_WriteByte(&msg, 0);
+	len = msg.position;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == -2);
+}
+
+static void Test_DeviceGroups_QueueSaturation(void) {
+	byte packet[] = { 1, 2, 3 };
+	int i;
+
+	DGR_FlushSendQueue();
+	for (i = 0; i < 8; i++) {
+		DGR_AddToSendQueue(packet, sizeof(packet));
+	}
+	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 8);
+	DGR_AddToSendQueue(packet, sizeof(packet));
+	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 8);
+	DGR_FlushSendQueue();
+	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 0);
+	DGR_AddToSendQueue(packet, sizeof(packet));
+	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 1);
+	DGR_FlushSendQueue();
+}
+
+static void Test_DeviceGroups_FullStatusFormat(void) {
+	byte buffer[128];
+	byte rgbcw[5] = { 1, 2, 3, 4, 5 };
+	bitMessage_t msg;
+	char groupName[32];
+	int len;
+
+	len = DGR_Quick_FormatFullStatus(buffer, sizeof(buffer), "status-test", 42,
+		5, 3, DGR_SHARE_POWER | DGR_SHARE_LIGHT_BRI | DGR_SHARE_LIGHT_SCHEME | DGR_SHARE_LIGHT_COLOR,
+		127, 2, rgbcw);
+	SELFTEST_ASSERT(len > 0);
+	MSG_BeginReading(&msg, buffer, len);
+	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
+	SELFTEST_ASSERT(MSG_ReadString(&msg, groupName, sizeof(groupName)) == 11);
+	SELFTEST_ASSERT(strcmp(groupName, "status-test") == 0);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 42);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 4);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 129);
+	SELFTEST_ASSERT(MSG_Read3Bytes(&msg) == 0);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 0);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 128);
+	SELFTEST_ASSERT(MSG_Read3Bytes(&msg) == 5);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 3);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 5);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 127);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 6);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 2);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 224);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 6);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 1);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 2);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 3);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 4);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 5);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) > 0);
+	SELFTEST_ASSERT(MSG_ReadByte(&msg) == 0);
+}
+
+static void Test_DeviceGroups_HeaderOnlyMessages(void) {
+	byte buffer[64];
+	bitMessage_t msg;
+	char groupName[32];
+	int len;
+
+	len = DGR_Quick_FormatACK(buffer, sizeof(buffer), "header-test", 7);
+	MSG_BeginReading(&msg, buffer, len);
+	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
+	SELFTEST_ASSERT(MSG_ReadString(&msg, groupName, sizeof(groupName)) == 11);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 7);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 8);
+	SELFTEST_ASSERT(MSG_EOF(&msg));
+
+	len = DGR_Quick_FormatAnnouncement(buffer, sizeof(buffer), "header-test", 7);
+	MSG_BeginReading(&msg, buffer, len);
+	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
+	SELFTEST_ASSERT(MSG_ReadString(&msg, groupName, sizeof(groupName)) == 11);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 7);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 64);
+	SELFTEST_ASSERT(MSG_EOF(&msg));
+
+	len = DGR_Quick_FormatStatusRequestWithFlags(buffer, sizeof(buffer), "header-test", 7,
+		1 | 2);
+	MSG_BeginReading(&msg, buffer, len);
+	SELFTEST_ASSERT(MSG_CheckAndSkip(&msg, "TASMOTA_DGR", 11) == 11);
+	SELFTEST_ASSERT(MSG_ReadString(&msg, groupName, sizeof(groupName)) == 11);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 7);
+	SELFTEST_ASSERT(MSG_ReadU16(&msg) == 3);
+	SELFTEST_ASSERT(MSG_EOF(&msg));
+}
+
+static void Test_DeviceGroups_ACKGroupFiltering(void) {
+	byte buffer[64];
+	int initialMembers;
+	int len;
+
+	SIM_ClearOBK(0);
+	CFG_DeviceGroups_SetName("ack-test");
+	CMD_ExecuteCommand("startDriver DGR", 0);
+	DGR_SpoofNextDGRPacketSource("192.168.0.124");
+	initialMembers = DGR_GetMemberCountForTest();
+	len = DGR_Quick_FormatACK(buffer, sizeof(buffer), "another-group", 10);
+	DGR_ProcessIncomingPacket((char*)buffer, len);
+	SELFTEST_ASSERT(DGR_GetMemberCountForTest() == initialMembers);
+	len = DGR_Quick_FormatACK(buffer, sizeof(buffer), "ACK-test", 10);
+	DGR_ProcessIncomingPacket((char*)buffer, len);
+	SELFTEST_ASSERT(DGR_GetMemberCountForTest() == initialMembers);
+	len = DGR_Quick_FormatACK(buffer, sizeof(buffer), "ack-test", 10);
+	DGR_ProcessIncomingPacket((char*)buffer, len);
+	SELFTEST_ASSERT(DGR_GetMemberCountForTest() == initialMembers + 1);
+}
+
+static void Test_DeviceGroups_WrapSafeTimer(void) {
+	SELFTEST_ASSERT(DGR_IsTimeReachedForTest(100, 100));
+	SELFTEST_ASSERT(DGR_IsTimeReachedForTest(101, 100));
+	SELFTEST_ASSERT(!DGR_IsTimeReachedForTest(99, 100));
+	SELFTEST_ASSERT(DGR_IsTimeReachedForTest(5, 0xFFFFFFF0));
+	SELFTEST_ASSERT(!DGR_IsTimeReachedForTest(0xFFFFFFF0, 5));
+}
 
 void SIM_SendFakeDGRPowerPacketToSelf(const char *groupName, int seq, int powerBits, int powerCount) {
 	byte buffer[256];
@@ -169,9 +357,16 @@ void Test_DeviceGroups_RGB() {
 
 }
 void Test_DeviceGroups() {
+	Test_DeviceGroups_BoundedStrings();
+	Test_DeviceGroups_TruncatedItems();
+	Test_DeviceGroups_FullStatusFormat();
+	Test_DeviceGroups_HeaderOnlyMessages();
+	Test_DeviceGroups_ACKGroupFiltering();
+	Test_DeviceGroups_WrapSafeTimer();
 
 	Test_DeviceGroups_TwoRelays();
 	Test_DeviceGroups_RGB();
+	Test_DeviceGroups_QueueSaturation();
 
 }
 
