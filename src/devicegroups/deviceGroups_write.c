@@ -171,18 +171,25 @@ int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName,
 	return msg.position;
 }
 
-static uint32_t dgr_command_values_8[64];
-static uint32_t dgr_command_values_16[64];
-static uint32_t dgr_command_values_32[64];
+static uint32_t dgr_command_values_8[4][64];
+static uint32_t dgr_command_values_16[4][64];
+static uint32_t dgr_command_values_32[4][64];
 
-static uint32_t *DGR_CommandValueSlot(byte item) {
-	if (item <= DGR_ITEM_MAX_8BIT) return &dgr_command_values_8[item];
-	if (item <= DGR_ITEM_MAX_16BIT) return &dgr_command_values_16[item - DGR_ITEM_MAX_8BIT - 1];
-	if (item <= DGR_ITEM_MAX_32BIT) return &dgr_command_values_32[item - DGR_ITEM_MAX_16BIT - 1];
+static uint32_t *DGR_CommandValueSlot(int stateIndex, byte item) {
+	if (stateIndex < 0 || stateIndex >= 4) stateIndex = 0;
+	if (item <= DGR_ITEM_MAX_8BIT) return &dgr_command_values_8[stateIndex][item];
+	if (item <= DGR_ITEM_MAX_16BIT) return &dgr_command_values_16[stateIndex][item - DGR_ITEM_MAX_8BIT - 1];
+	if (item <= DGR_ITEM_MAX_32BIT) return &dgr_command_values_32[stateIndex][item - DGR_ITEM_MAX_16BIT - 1];
 	return 0;
 }
 
-int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, const char *items) {
+void DGR_CommandSetValue(int stateIndex, byte item, uint32_t value) {
+	uint32_t *slot = DGR_CommandValueSlot(stateIndex, item);
+	if (slot) *slot = value;
+}
+
+int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
+	int stateIndex, const char *items) {
 	bitMessage_t msg;
 	const char *p = items;
 	int itemCount = 0;
@@ -204,7 +211,7 @@ int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, ui
 		if (!MSG_WriteByte(&msg, item)) return -1;
 		if (item <= DGR_ITEM_MAX_32BIT) {
 			uint32_t value;
-			uint32_t *slot = DGR_CommandValueSlot(item);
+			uint32_t *slot = DGR_CommandValueSlot(stateIndex, item);
 			char oper = 0;
 			if (*p == '@') { oper = p[1]; p += 2; }
 			value = (*p >= '0' && *p <= '9') ? strtoul(p, &end, 0) : (oper == '^' ? 0xFFFFFFFF : 1);
@@ -218,7 +225,7 @@ int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, ui
 				else return -1;
 			}
 			if (item == DGR_ITEM_POWER && !(value >> 24)) value |= 1UL << 24;
-			if (slot) *slot = value;
+			DGR_CommandSetValue(stateIndex, item, value);
 			if (!MSG_WriteByte(&msg, value & 0xFF)) return -1;
 			if (item > DGR_ITEM_MAX_8BIT && !MSG_WriteByte(&msg, (value >> 8) & 0xFF)) return -1;
 			if (item > DGR_ITEM_MAX_16BIT

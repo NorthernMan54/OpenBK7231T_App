@@ -94,6 +94,7 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 			itemFlags = 0;
 			continue;
 		}
+		DGR_CommandSetValue(dev ? dev->gr.stateIndex : 0, item, value);
 		process = DGR_ShouldProcessItem(dev, item, itemFlags);
 		if (process) {
 			switch (item) {

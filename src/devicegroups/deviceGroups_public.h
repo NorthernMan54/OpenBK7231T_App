@@ -35,6 +35,7 @@ typedef struct dgrGroupDef_s {
 	unsigned int devGroupShare_Out;
 	unsigned int *noStatusShare;
 	bool local;
+	int stateIndex;
 } dgrGroupDef_t;
 
 typedef struct dgrDevice_s {
@@ -57,6 +58,8 @@ int DGR_Quick_FormatStatusRequestWithFlags(byte *buffer, int maxSize, const char
 int DGR_Quick_FormatFullStatus(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
 	int relayStates, int numChannels, int shareFlags, unsigned int noStatusShare,
 	byte brightness, byte scheme, const byte *rgbcw);
-int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence, const char *items);
+int DGR_Quick_FormatCommand(byte *buffer, int maxSize, const char *groupName, uint16_t sequence,
+	int stateIndex, const char *items);
+void DGR_CommandSetValue(int stateIndex, byte item, uint32_t value);
 
 #endif
