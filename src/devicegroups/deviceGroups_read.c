@@ -94,6 +94,8 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 			itemFlags = 0;
 			continue;
 		}
+		/* Validate values independently of the configured receive mask. */
+		if (item == DGR_ITEM_POWER && (value >> 24) > 24) return -2;
 		DGR_CommandSetValue(dev ? dev->gr.stateIndex : 0, item, value);
 		process = DGR_ShouldProcessItem(dev, item, itemFlags);
 		if (process) {
@@ -107,7 +109,6 @@ int DGR_Parse(const byte *data, int len, dgrDevice_t *dev, struct sockaddr *addr
 				case DGR_ITEM_BRI_PRESET_HIGH: if (dev->cbs.processBrightnessPresetHigh) dev->cbs.processBrightnessPresetHigh((byte)value); break;
 				case DGR_ITEM_BRI_POWER_ON: if (dev->cbs.processBrightnessPowerOn) dev->cbs.processBrightnessPowerOn((byte)value); break;
 				case DGR_ITEM_POWER:
-					if ((value >> 24) > 24) return -2;
 					if (dev->cbs.processPower) dev->cbs.processPower(value & 0xFFFFFF, value >> 24);
 					break;
 			}

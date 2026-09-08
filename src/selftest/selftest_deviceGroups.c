@@ -10,6 +10,7 @@ void DGR_FlushSendQueue(void);
 int DGR_GetPendingPacketCountForTest(void);
 int DGR_GetMemberCountForTest(void);
 int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline);
+void SIM_SendFakeDGRPowerPacketToSelf(const char *groupName, int seq, int powerBits, int powerCount);
 
 static int sim_fakeSeq = 1;
 static int dgrTestFade;
