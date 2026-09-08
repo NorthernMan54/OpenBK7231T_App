@@ -185,7 +185,7 @@ static void Test_DeviceGroups_CommandFormatAndExtendedItems(void) {
 	char groupName[32];
 	int len;
 
-	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "command-test", 55,
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "command-test", 55, 0,
 		"3=1 4=9 6=2 8=20 9=80 192=hello\\ world 224=#010203040506");
 	SELFTEST_ASSERT(len > 0);
 	MSG_BeginReading(&msg, buffer, len);
@@ -226,14 +226,78 @@ static void Test_DeviceGroups_NoShareItemFlag(void) {
 	device.gr.noStatusShare = &noStatusShare;
 	device.cbs.processLightBrightness = DGR_TestFade;
 	dgrTestFade = 0;
-	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 1, "5=N77");
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 1, 0, "5=N77");
 	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
 	SELFTEST_ASSERT(dgrTestFade == 0);
 	SELFTEST_ASSERT(noStatusShare & DGR_SHARE_LIGHT_BRI);
-	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 2, "5=88");
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "noshare-test", 2, 0, "5=88");
 	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
 	SELFTEST_ASSERT(dgrTestFade == 88);
 	SELFTEST_ASSERT((noStatusShare & DGR_SHARE_LIGHT_BRI) == 0);
+}
+
+static void Test_DeviceGroups_CommandStateIsPerGroup(void) {
+	byte buffer[128];
+	dgrDevice_t device;
+	struct sockaddr_in source;
+	uint32_t noStatusShare = 0;
+	int len;
+
+	memset(&device, 0, sizeof(device));
+	memset(&source, 0, sizeof(source));
+	strcpy_safe(device.gr.groupName, "state-test", sizeof(device.gr.groupName));
+	device.gr.devGroupShare_In = DGR_SHARE_LIGHT_BRI;
+	device.gr.noStatusShare = &noStatusShare;
+	device.cbs.processLightBrightness = DGR_TestFade;
+
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "state-test", 1, 0, "5=10");
+	SELFTEST_ASSERT(len > 0);
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "state-test", 1, 1, "5=20");
+	SELFTEST_ASSERT(len > 0);
+
+	device.gr.stateIndex = 0;
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "state-test", 2, 0, "5=@+1");
+	dgrTestFade = 0;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
+	SELFTEST_ASSERT(dgrTestFade == 11);
+
+	device.gr.stateIndex = 1;
+	len = DGR_Quick_FormatCommand(buffer, sizeof(buffer), "state-test", 2, 1, "5=@+1");
+	dgrTestFade = 0;
+	SELFTEST_ASSERT(DGR_Parse(buffer, len, &device, (struct sockaddr *)&source) == 0);
+	SELFTEST_ASSERT(dgrTestFade == 21);
+}
+
+static void Test_DeviceGroups_MultipleGroupsAndTies(void) {
+	SIM_ClearOBK(0);
+	CFG_DeviceGroups_SetNameByIndex(0, "relay-one");
+	CFG_DeviceGroups_SetNameByIndex(1, "relay-two");
+	CFG_DeviceGroups_SetNameByIndex(2, "");
+	CFG_DeviceGroups_SetNameByIndex(3, "");
+	CFG_DeviceGroups_SetTie(0, 1);
+	CFG_DeviceGroups_SetTie(1, 2);
+	CFG_DeviceGroups_SetRecvFlags(DGR_SHARE_POWER);
+	CFG_DeviceGroups_SetSendFlags(DGR_SHARE_POWER);
+	SELFTEST_ASSERT(strcmp(CFG_DeviceGroups_GetNameByIndex(0), "relay-one") == 0);
+	SELFTEST_ASSERT(strcmp(CFG_DeviceGroups_GetNameByIndex(1), "relay-two") == 0);
+	SELFTEST_ASSERT(CFG_DeviceGroups_GetTie(0) == 1);
+	SELFTEST_ASSERT(CFG_DeviceGroups_GetTie(1) == 2);
+	SELFTEST_ASSERT(CFG_DeviceGroups_GetCount() == 2);
+
+	PIN_SetPinRoleForPinIndex(9, IOR_Relay);
+	PIN_SetPinChannelForPinIndex(9, 1);
+	PIN_SetPinRoleForPinIndex(10, IOR_Relay);
+	PIN_SetPinChannelForPinIndex(10, 2);
+	CHANNEL_Set(1, 0, 0);
+	CHANNEL_Set(2, 0, 0);
+	CMD_ExecuteCommand("startDriver DGR", 0);
+	SIM_SendFakeDGRPowerPacketToSelf("relay-two", 10, 1, 1);
+	SELFTEST_ASSERT_CHANNEL(1, 0);
+	SELFTEST_ASSERT_CHANNEL(2, 1);
+	/* Per-group sequence tracking must accept the same sequence from the same IP. */
+	SIM_SendFakeDGRPowerPacketToSelf("relay-one", 10, 1, 1);
+	SELFTEST_ASSERT_CHANNEL(1, 1);
+	SELFTEST_ASSERT_CHANNEL(2, 1);
 }
 
 static void Test_DeviceGroups_ACKGroupFiltering(void) {
@@ -434,6 +498,8 @@ void Test_DeviceGroups() {
 	Test_DeviceGroups_HeaderOnlyMessages();
 	Test_DeviceGroups_CommandFormatAndExtendedItems();
 	Test_DeviceGroups_NoShareItemFlag();
+	Test_DeviceGroups_CommandStateIsPerGroup();
+	Test_DeviceGroups_MultipleGroupsAndTies();
 	Test_DeviceGroups_ACKGroupFiltering();
 	Test_DeviceGroups_WrapSafeTimer();
 

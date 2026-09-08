@@ -24,6 +24,56 @@
 
 #define MAX_DGR_PACKET 128
 #define MAX_DGR_QUEUE_SIZE 8
+#define MAX_DGR_MEMBERS 32
+
+typedef struct dgrMember_s {
+	uint32_t ip;
+	uint16_t lastSeq;
+	uint16_t acked_sequence;
+	uint32_t unicast_count;
+} dgrMember_t;
+
+typedef struct dgrRuntime_s {
+	uint16_t send_seq;
+	uint32_t next_announcement_time;
+	uint32_t initial_discovery_remaining;
+	uint32_t next_discovery_time;
+	uint16_t discovery_sequence;
+	byte reliable_message[MAX_DGR_PACKET];
+	uint16_t reliable_message_length;
+	uint16_t reliable_sequence;
+	uint16_t last_full_status_sequence;
+	uint16_t incoming_flags;
+	uint32_t no_status_share;
+	uint32_t next_ack_check_time;
+	uint32_t member_timeout_time;
+	uint16_t ack_check_interval;
+	int retry_member_cursor;
+	dgrMember_t members[MAX_DGR_MEMBERS];
+	int member_count;
+} dgrRuntime_t;
+
+static dgrRuntime_t g_dgr_groups[CFG_DEVICE_GROUP_MAX];
+static dgrRuntime_t *g_dgr_current = &g_dgr_groups[0];
+static int g_dgr_current_index = 0;
+
+#define g_dgr_send_seq (g_dgr_current->send_seq)
+#define g_dgr_next_announcement_time (g_dgr_current->next_announcement_time)
+#define g_dgr_initial_discovery_remaining (g_dgr_current->initial_discovery_remaining)
+#define g_dgr_next_discovery_time (g_dgr_current->next_discovery_time)
+#define g_dgr_discovery_sequence (g_dgr_current->discovery_sequence)
+#define g_dgr_reliable_message (g_dgr_current->reliable_message)
+#define g_dgr_reliable_message_length (g_dgr_current->reliable_message_length)
+#define g_dgr_reliable_sequence (g_dgr_current->reliable_sequence)
+#define g_dgr_last_full_status_sequence (g_dgr_current->last_full_status_sequence)
+#define g_dgr_incoming_flags (g_dgr_current->incoming_flags)
+#define g_dgr_no_status_share (g_dgr_current->no_status_share)
+#define g_dgr_next_ack_check_time (g_dgr_current->next_ack_check_time)
+#define g_dgr_member_timeout_time (g_dgr_current->member_timeout_time)
+#define g_dgr_ack_check_interval (g_dgr_current->ack_check_interval)
+#define g_dgr_retry_member_cursor (g_dgr_current->retry_member_cursor)
+#define g_dgrMembers (g_dgr_current->members)
+#define g_curDGRMembers (g_dgr_current->member_count)
 
 static void DRV_DGR_ProcessTextCommand(const char *value, byte length) {
 	char command[MAX_DGR_PACKET];
@@ -57,26 +107,31 @@ static int g_dgr_stat_sent = 0;
 static int g_dgr_stat_received = 0;
 struct sockaddr_in g_mySockAddr;
 
-static uint16_t g_dgr_send_seq = 1;
-static uint32_t g_dgr_next_announcement_time = 0;  // Time to send next announcement
-static uint32_t g_dgr_initial_discovery_remaining = 0;  // Count of initial discovery messages to send
-static uint32_t g_dgr_next_discovery_time = 0;
-static uint16_t g_dgr_discovery_sequence = 0;
-static byte g_dgr_reliable_message[MAX_DGR_PACKET];
-static uint16_t g_dgr_reliable_message_length = 0;
-static uint16_t g_dgr_reliable_sequence = 0;
-static uint16_t g_dgr_last_full_status_sequence = 0xFFFF;
-static uint16_t g_dgr_incoming_flags = 0;
-static uint32_t g_dgr_no_status_share = 0;
-static uint32_t g_dgr_next_ack_check_time = 0;
-static uint32_t g_dgr_member_timeout_time = 0;
-static uint16_t g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
-static int g_dgr_retry_member_cursor = 0;
-
 const char *HAL_GetMyIPString();
 
 void DRV_DGR_Dump(byte *message, int len);
 void DRV_DGR_SendFullStatus(const char *groupName);
+
+static void DGR_SelectGroup(int index) {
+	if (index < 0 || index >= CFG_DEVICE_GROUP_MAX) index = 0;
+	g_dgr_current_index = index;
+	g_dgr_current = &g_dgr_groups[index];
+}
+
+static int DGR_SelectGroupByName(const char *groupName) {
+	int i;
+	if (groupName) {
+		for (i = 0; i < CFG_DEVICE_GROUP_MAX; i++) {
+			const char *configuredName = CFG_DeviceGroups_GetNameByIndex(i);
+			if (configuredName[0] && strcmp(configuredName, groupName) == 0) {
+				DGR_SelectGroup(i);
+				return i;
+			}
+		}
+	}
+	DGR_SelectGroup(0);
+	return -1;
+}
 
 //
 // A DGR outgoing packets queue mechanism.
@@ -268,13 +323,13 @@ void DRV_DGR_CreateSocket_Send() {
 	addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DRV_DGR_CreateSocket_Send: socket created");
 }
 void DRV_DGR_Send_Generic(byte *message, int len, const char *groupName) {
+	int groupIndex = DGR_SelectGroupByName(groupName);
 	// if this send is as a result of use RXing something, 
 	// don't send it....
 	if (g_inCmdProcessing || g_dgr_initial_discovery_remaining){
 		return;
 	}
-	if (g_dgr_reliable_message_length && groupName
-		&& strcmp(groupName, CFG_DeviceGroups_GetName()) == 0) {
+	if (g_dgr_reliable_message_length && groupIndex >= 0) {
 		// Tasmota merges new state into an unacknowledged update. A fresh full-status
 		// packet provides the same convergence guarantee with this simpler formatter.
 		DRV_DGR_SendFullStatus(groupName);
@@ -284,7 +339,7 @@ void DRV_DGR_Send_Generic(byte *message, int len, const char *groupName) {
 	// This is here only because sending UDP from MQTT callback crashes BK for me
 	// So instead, we are making a queue which is sent in quick tick
 	if (DGR_AddToSendQueueInternal(message, len, 0)) {
-		if (groupName && strcmp(groupName, CFG_DeviceGroups_GetName()) == 0) {
+		if (groupIndex >= 0) {
 			DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
 		}
 		g_dgr_send_seq++;
@@ -315,6 +370,7 @@ void DRV_DGR_Send_Power(const char *groupName, int channelValues, int numChannel
 		return;
 	}
 
+	DGR_SelectGroupByName(groupName);
 	len = DGR_Quick_FormatPowerState(message,sizeof(message),groupName,g_dgr_send_seq, 0,channelValues, numChannels);
 
 	DRV_DGR_Send_Generic(message,len,groupName);
@@ -328,6 +384,7 @@ void DRV_DGR_Send_Brightness(const char *groupName, byte brightness){
 		return;
 	}
 
+	DGR_SelectGroupByName(groupName);
 	len = DGR_Quick_FormatBrightness(message,sizeof(message),groupName,g_dgr_send_seq, 0, brightness);
 
 	DRV_DGR_Send_Generic(message,len,groupName);
@@ -341,6 +398,7 @@ void DRV_DGR_Send_RGBCW(const char *groupName, byte *rgbcw){
 		return;
 	}
 
+	DGR_SelectGroupByName(groupName);
 	len = DGR_Quick_FormatRGBCW(message,sizeof(message),groupName,g_dgr_send_seq, 0, rgbcw[0],rgbcw[1],rgbcw[2],rgbcw[3],rgbcw[4]);
 
 	DRV_DGR_Send_Generic(message,len,groupName);
@@ -354,6 +412,7 @@ void DRV_DGR_Send_FixedColor(const char *groupName, int colorIndex) {
 		return;
 	}
 
+	DGR_SelectGroupByName(groupName);
 	len = DGR_Quick_FormatFixedColor(message, sizeof(message), groupName, g_dgr_send_seq, 0, colorIndex);
 
 	DRV_DGR_Send_Generic(message, len, groupName);
@@ -365,6 +424,7 @@ void DRV_DGR_SendAnnouncement(const char *groupName) {
 	byte message[64];
 
 	// Announcements are always sent, even during command processing
+	DGR_SelectGroupByName(groupName);
 	len = DGR_Quick_FormatAnnouncement(message, sizeof(message), groupName, g_dgr_send_seq);
 
 	// Don't increment sequence for announcements (they use current sequence)
@@ -471,6 +531,14 @@ void DRV_DGR_processPower(int relayStates, byte relaysCount) {
 
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR, "DRV_DGR_processPower: cnt %i, val %i", (int)relaysCount, relayStates);
 
+	if (CFG_DeviceGroups_GetTie(g_dgr_current_index) > 0) {
+		int relay = CFG_DeviceGroups_GetTie(g_dgr_current_index);
+		startIndex = CHANNEL_HasChannelPinWithRoleOrRole(0, IOR_Relay, IOR_Relay_n) ? 0 : 1;
+		ch = startIndex + relay - 1;
+		CHANNEL_Set(ch, BIT_CHECK(relayStates, 0), 0);
+		return;
+	}
+
 #if ENABLE_LED_BASIC
 	if(PIN_CountPinsWithRoleOrRole(IOR_PWM,IOR_PWM_n) > 0 || LED_IsLedDriverChipRunning()) {
 		LED_SetEnableAll(BIT_CHECK(relayStates,0));
@@ -516,16 +584,6 @@ void DRV_DGR_processLightBrightness(byte brightness) {
 	LED_SetDimmer(Val255ToVal100(brightness));
 }
 #endif
-typedef struct dgrMmember_s {
-	int ip;
-	uint16_t lastSeq;
-	uint16_t acked_sequence;			// Last sequence we received ACK for
-	uint32_t unicast_count;
-} dgrMember_t;
-
-#define MAX_DGR_MEMBERS 32
-static dgrMember_t g_dgrMembers[MAX_DGR_MEMBERS];
-static int g_curDGRMembers = 0;
 static struct sockaddr_in addr;
 
 #if WINDOWS
@@ -617,6 +675,7 @@ void DRV_DGR_RunEverySecond() {
 	const char *myip;
 	uint32_t now;
 	const char *groupName;
+	int groupIndex;
 
 	// TODO: do it only on IP change?
 	myip = HAL_GetMyIPString();
@@ -635,9 +694,12 @@ void DRV_DGR_RunEverySecond() {
 					DRV_DGR_CreateSocket_Send();
 				}
 				if (g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) {
-					groupName = CFG_DeviceGroups_GetName();
-					if(groupName && groupName[0]) {
-						DGR_StartDiscovery();
+					for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+						groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
+						if (groupName[0]) {
+							DGR_SelectGroup(groupIndex);
+							DGR_StartDiscovery();
+						}
 					}
 				}
 		}
@@ -645,21 +707,14 @@ void DRV_DGR_RunEverySecond() {
 	}
 
 	now = xTaskGetTickCount() / portTICK_PERIOD_MS;  // Current time in milliseconds
-	groupName = CFG_DeviceGroups_GetName();
-	if(!groupName || !groupName[0]) {
-		return;  // No group configured
-	}
-
-	if(g_dgr_initial_discovery_remaining > 0) {
-		return;
-	}
-
-	// Send periodic announcements (heartbeat every DGR_ANNOUNCEMENT_INTERVAL ms)
-	if(DGR_TimeReached(now, g_dgr_next_announcement_time)) {
-		DRV_DGR_SendAnnouncement(groupName);
-		// Schedule next announcement with random jitter (60-70 seconds)
-		g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL + (rand() % 10000);
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Scheduled next announcement in %lu ms", DGR_ANNOUNCEMENT_INTERVAL);
+	for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+		groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
+		if (!groupName[0]) continue;
+		DGR_SelectGroup(groupIndex);
+		if (!g_dgr_initial_discovery_remaining && DGR_TimeReached(now, g_dgr_next_announcement_time)) {
+			DRV_DGR_SendAnnouncement(groupName);
+			g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL + (rand() % 10000);
+		}
 	}
 }
 void DGR_SpoofNextDGRPacketSource(const char *ipStrs) {
@@ -680,9 +735,12 @@ void DRV_DGR_SendFullStatus(const char *groupName) {
 	byte brightness = 0;
 	byte scheme = 0;
 	int i;
+	int tie;
+	DGR_SelectGroupByName(groupName);
 	if (g_dgr_initial_discovery_remaining) {
 		return;
 	}
+	tie = CFG_DeviceGroups_GetTie(g_dgr_current_index);
 
 #if ENABLE_LED_BASIC
 	if(PIN_CountPinsWithRoleOrRole(IOR_PWM, IOR_PWM_n) > 0 || LED_IsLedDriverChipRunning()) {
@@ -711,6 +769,11 @@ void DRV_DGR_SendFullStatus(const char *groupName) {
 			}
 		}
 	}
+	if (tie > 0) {
+		startIndex = CHANNEL_HasChannelPinWithRoleOrRole(0, IOR_Relay, IOR_Relay_n) ? 0 : 1;
+		relayStates = CHANNEL_Get(startIndex + tie - 1) ? 1 : 0;
+		numChannels = 1;
+	}
 
 	len = DGR_Quick_FormatFullStatus(message, sizeof(message), groupName, g_dgr_send_seq,
 		relayStates, numChannels, shareFlags, g_dgr_no_status_share, brightness, scheme, rgbcw);
@@ -730,7 +793,7 @@ static void DRV_DGR_SendFullStatus_Callback(void) {
 	dgrMember_t *member = findMember();
 	if ((g_dgr_incoming_flags & DGR_FLAG_RESET) || member == 0
 		|| member->acked_sequence != g_dgr_last_full_status_sequence) {
-		DRV_DGR_SendFullStatus(CFG_DeviceGroups_GetName());
+		DRV_DGR_SendFullStatus(CFG_DeviceGroups_GetNameByIndex(g_dgr_current_index));
 	}
 }
 
@@ -743,7 +806,7 @@ static void DGR_RunDiscovery(uint32_t now) {
 	if (!g_dgr_initial_discovery_remaining || !DGR_TimeReached(now, g_dgr_next_discovery_time)) {
 		return;
 	}
-	groupName = CFG_DeviceGroups_GetName();
+	groupName = CFG_DeviceGroups_GetNameByIndex(g_dgr_current_index);
 	flags = DGR_FLAG_STATUS_REQUEST;
 	if (g_dgr_initial_discovery_remaining == 10) {
 		flags |= DGR_FLAG_RESET;
@@ -846,11 +909,11 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	}
 	sequence = MSG_ReadU16(&msg);
 	flags = MSG_ReadU16(&msg);
-	g_dgr_incoming_flags = flags;
-	if(strcmp(groupName, CFG_DeviceGroups_GetName()) != 0) {
-		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_ProcessIncomingPacket: Ignoring packet for group '%s' (ours is '%s')", groupName, CFG_DeviceGroups_GetName());
+	if (DGR_SelectGroupByName(groupName) < 0) {
+		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR ignoring packet for unconfigured group '%s'", groupName);
 		return;
 	}
+	g_dgr_incoming_flags = flags;
 	if (findMember() == 0) {
 		return;
 	}
@@ -862,10 +925,11 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	}
 
 	memset(&def, 0, sizeof(def));
-	strcpy_safe(def.gr.groupName, CFG_DeviceGroups_GetName(), sizeof(def.gr.groupName));
+	strcpy_safe(def.gr.groupName, CFG_DeviceGroups_GetNameByIndex(g_dgr_current_index), sizeof(def.gr.groupName));
 	def.gr.devGroupShare_In = CFG_DeviceGroups_GetRecvFlags();
 	def.gr.devGroupShare_Out = CFG_DeviceGroups_GetSendFlags();
 	def.gr.noStatusShare = &g_dgr_no_status_share;
+	def.gr.stateIndex = g_dgr_current_index;
 #if ENABLE_LED_BASIC
 	def.cbs.processBrightnessPowerOn = DRV_DGR_processBrightnessPowerOn;
 	def.cbs.processLightBrightness = DRV_DGR_processLightBrightness;
@@ -913,8 +977,13 @@ void DRV_DGR_RunQuickTick() {
 	}
 	{
 		uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
-		DGR_RunDiscovery(now);
-		DGR_RunReliability(now);
+		int groupIndex;
+		for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+			if (!CFG_DeviceGroups_GetNameByIndex(groupIndex)[0]) continue;
+			DGR_SelectGroup(groupIndex);
+			DGR_RunDiscovery(now);
+			DGR_RunReliability(now);
+		}
 	}
     // send pending
 	DGR_FlushSendQueue();
@@ -968,17 +1037,13 @@ void DRV_DGR_Shutdown()
 	}
 	dgr_retry_time_left = 5;
 	g_inCmdProcessing = 0;
-	g_dgr_send_seq = 1;
-	g_dgr_next_announcement_time = 0;
-	g_dgr_initial_discovery_remaining = 0;
-	g_dgr_next_discovery_time = 0;
-	g_dgr_discovery_sequence = 0;
-	g_dgr_reliable_message_length = 0;
-	g_dgr_next_ack_check_time = 0;
-	g_dgr_last_full_status_sequence = 0xFFFF;
-	g_dgr_incoming_flags = 0;
-	g_dgr_no_status_share = 0;
-	g_dgr_retry_member_cursor = 0;
+	memset(g_dgr_groups, 0, sizeof(g_dgr_groups));
+	for (int i = 0; i < CFG_DEVICE_GROUP_MAX; i++) {
+		g_dgr_groups[i].send_seq = 1;
+		g_dgr_groups[i].last_full_status_sequence = 0xFFFF;
+		g_dgr_groups[i].ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+	}
+	DGR_SelectGroup(0);
 }
 
 void DRV_DGR_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreState) {
@@ -1068,6 +1133,8 @@ void DRV_DGR_OnChannelChanged(int ch, int value) {
 	int i;
 	const char *groupName;
 	int firstChannelOffset;
+	int groupIndex;
+	int relayNumber;
 
 	if(g_dgr_socket_receive==0) {
 		return;
@@ -1084,7 +1151,7 @@ void DRV_DGR_OnChannelChanged(int ch, int value) {
 	}
 	channelValues = 0;
 	channelsCount = 0;
-	groupName = CFG_DeviceGroups_GetName();
+	groupName = CFG_DeviceGroups_GetNameByIndex(0);
 
 	// we have channel indices starting from 0 but some people start with 1
 	// check if we need to offset
@@ -1095,6 +1162,15 @@ void DRV_DGR_OnChannelChanged(int ch, int value) {
 	else {
 		firstChannelOffset = 1;
 	}
+	relayNumber = ch - firstChannelOffset + 1;
+	for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+		int tie = CFG_DeviceGroups_GetTie(groupIndex);
+		const char *tiedGroup = CFG_DeviceGroups_GetNameByIndex(groupIndex);
+		if (tie > 0 && tie == relayNumber && tiedGroup[0]) {
+			DRV_DGR_Send_Power(tiedGroup, value ? 1 : 0, 1);
+		}
+	}
+	if (CFG_DeviceGroups_GetTie(0) > 0) return;
 
 
 	for(i = 0; i < CHANNEL_MAX-1; i++) {
@@ -1109,7 +1185,7 @@ void DRV_DGR_OnChannelChanged(int ch, int value) {
 			}
 		} 
 	}
-	if(channelsCount>0){
+	if(channelsCount > 0 && groupName[0]){
 		DRV_DGR_Send_Power(groupName,channelValues,channelsCount);
 	}
 }
@@ -1209,9 +1285,17 @@ static commandResult_t CMD_DGR_DevGroupSend(const void *context, const char *cmd
 	byte message[MAX_DGR_PACKET];
 	dgrDevice_t def;
 	int len;
-	const char *groupName = CFG_DeviceGroups_GetName();
+	int groupIndex = (int)(intptr_t)context;
+	const char *groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
 	if (!groupName || !groupName[0] || !args || !args[0]) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	len = DGR_Quick_FormatCommand(message, sizeof(message), groupName, g_dgr_send_seq, args);
+	DGR_SelectGroup(groupIndex);
+	/* Tasmota reserves "DevGroupSend 1" for publishing every current item. */
+	if (strcmp(args, "1") == 0) {
+		g_dgr_no_status_share = 0;
+		DRV_DGR_SendFullStatus(groupName);
+		return CMD_RES_OK;
+	}
+	len = DGR_Quick_FormatCommand(message, sizeof(message), groupName, g_dgr_send_seq, groupIndex, args);
 	if (len <= 0) return CMD_RES_BAD_ARGUMENT;
 	if (!DGR_AddToSendQueueInternal(message, len, 0)) return CMD_RES_ERROR;
 	DGR_RecordReliableMessage(message, len, g_dgr_send_seq);
@@ -1224,6 +1308,7 @@ static commandResult_t CMD_DGR_DevGroupSend(const void *context, const char *cmd
 	def.gr.devGroupShare_In = 0xFFFFFFFF;
 	def.gr.noStatusShare = &g_dgr_no_status_share;
 	def.gr.local = true;
+	def.gr.stateIndex = groupIndex;
 #if ENABLE_LED_BASIC
 	def.cbs.processBrightnessPowerOn = DRV_DGR_processBrightnessPowerOn;
 	def.cbs.processLightBrightness = DRV_DGR_processLightBrightness;
@@ -1240,11 +1325,31 @@ static commandResult_t CMD_DGR_DevGroupSend(const void *context, const char *cmd
 }
 
 static commandResult_t CMD_DGR_DevGroupName(const void *context, const char *cmd, const char *args, int flags) {
+	int groupIndex = (int)(intptr_t)context;
 	if (args && args[0]) {
-		CFG_DeviceGroups_SetName((strcmp(args, "0") == 0 || strcmp(args, "\"") == 0) ? "" : args);
+		CFG_DeviceGroups_SetNameByIndex(groupIndex, (strcmp(args, "0") == 0 || strcmp(args, "\"") == 0) ? "" : args);
+		CFG_Save_IfThereArePendingChanges();
+		memset(&g_dgr_groups[groupIndex], 0, sizeof(g_dgr_groups[groupIndex]));
+		g_dgr_groups[groupIndex].send_seq = 1;
+		g_dgr_groups[groupIndex].last_full_status_sequence = 0xFFFF;
+		g_dgr_groups[groupIndex].ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+		DGR_SelectGroup(groupIndex);
+		if (CFG_DeviceGroups_GetNameByIndex(groupIndex)[0]
+			&& g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) DGR_StartDiscovery();
+	}
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupName%u %s", groupIndex + 1, CFG_DeviceGroups_GetNameByIndex(groupIndex));
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_DGR_DevGroupTie(const void *context, const char *cmd, const char *args, int flags) {
+	int groupIndex = (int)(intptr_t)context;
+	if (args && args[0]) {
+		int relay = strtol(args, 0, 0);
+		if (relay < 0 || relay > 24) return CMD_RES_BAD_ARGUMENT;
+		CFG_DeviceGroups_SetTie(groupIndex, relay);
 		CFG_Save_IfThereArePendingChanges();
 	}
-	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupName %s", CFG_DeviceGroups_GetName());
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupTie%u %u", groupIndex + 1, CFG_DeviceGroups_GetTie(groupIndex));
 	return CMD_RES_OK;
 }
 
@@ -1267,8 +1372,10 @@ static commandResult_t CMD_DGR_DevGroupShare(const void *context, const char *cm
 
 static commandResult_t CMD_DGR_DevGroupStatus(const void *context, const char *cmd, const char *args, int flags) {
 	int i;
-	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupStatus GroupName=%s MessageSeq=%u MemberCount=%i",
-		CFG_DeviceGroups_GetName(), g_dgr_send_seq, g_curDGRMembers);
+	int groupIndex = (int)(intptr_t)context;
+	DGR_SelectGroup(groupIndex);
+	addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DevGroupStatus Index=%u GroupName=%s MessageSeq=%u MemberCount=%i",
+		groupIndex + 1, CFG_DeviceGroups_GetNameByIndex(groupIndex), g_dgr_send_seq, g_curDGRMembers);
 	for (i = 0; i < g_curDGRMembers; i++) {
 		struct in_addr memberAddress;
 		memberAddress.s_addr = g_dgrMembers[i].ip;
@@ -1281,29 +1388,27 @@ static commandResult_t CMD_DGR_DevGroupStatus(const void *context, const char *c
 
 void DRV_DGR_Init()
 {
-	memset(&g_dgrMembers[0],0,sizeof(g_dgrMembers));
-	g_curDGRMembers = 0;
-	g_dgr_send_seq = 1;
-	g_dgr_next_announcement_time = 0;
-	g_dgr_initial_discovery_remaining = 0;
-	g_dgr_next_discovery_time = 0;
-	g_dgr_reliable_message_length = 0;
-	g_dgr_next_ack_check_time = 0;
-	g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
-	g_dgr_member_timeout_time = 0;
-	g_dgr_last_full_status_sequence = 0xFFFF;
-	g_dgr_incoming_flags = 0;
-	g_dgr_retry_member_cursor = 0;
+	int groupIndex;
+	memset(g_dgr_groups, 0, sizeof(g_dgr_groups));
+	for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+		g_dgr_groups[groupIndex].send_seq = 1;
+		g_dgr_groups[groupIndex].ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
+		g_dgr_groups[groupIndex].last_full_status_sequence = 0xFFFF;
+	}
+	DGR_SelectGroup(0);
 
 	DRV_DGR_CreateSocket_Receive();
 	DRV_DGR_CreateSocket_Send();
 
 	// Start initial discovery if sockets were created successfully
 	if (g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) {
-		const char *groupName = CFG_DeviceGroups_GetName();
-		if (groupName && groupName[0]) {
-			DGR_StartDiscovery();
-			addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DRV_DGR_Init: Starting initial discovery (10 requests)");
+		for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+			const char *groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
+			if (groupName[0]) {
+				DGR_SelectGroup(groupIndex);
+				DGR_StartDiscovery();
+				addLogAdv(LOG_INFO, LOG_FEATURE_DGR, "DRV_DGR_Init: Discovering group %u (%s)", groupIndex + 1, groupName);
+			}
 		}
 	}
 
@@ -1327,8 +1432,25 @@ void DRV_DGR_Init()
 	//cmddetail:"fn":"CMD_DGR_SendFixedColor","file":"driver/drv_tasmotaDeviceGroups.c","requires":"",
 	//cmddetail:"examples":""}
 	CMD_RegisterCommand("DGR_SendFixedColor", CMD_DGR_SendFixedColor, NULL);
-	CMD_RegisterCommand("DevGroupSend", CMD_DGR_DevGroupSend, NULL);
-	CMD_RegisterCommand("DevGroupName", CMD_DGR_DevGroupName, NULL);
+	CMD_RegisterCommand("DevGroupSend", CMD_DGR_DevGroupSend, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupSend1", CMD_DGR_DevGroupSend, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupSend2", CMD_DGR_DevGroupSend, (void *)(intptr_t)1);
+	CMD_RegisterCommand("DevGroupSend3", CMD_DGR_DevGroupSend, (void *)(intptr_t)2);
+	CMD_RegisterCommand("DevGroupSend4", CMD_DGR_DevGroupSend, (void *)(intptr_t)3);
+	CMD_RegisterCommand("DevGroupName", CMD_DGR_DevGroupName, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupName1", CMD_DGR_DevGroupName, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupName2", CMD_DGR_DevGroupName, (void *)(intptr_t)1);
+	CMD_RegisterCommand("DevGroupName3", CMD_DGR_DevGroupName, (void *)(intptr_t)2);
+	CMD_RegisterCommand("DevGroupName4", CMD_DGR_DevGroupName, (void *)(intptr_t)3);
 	CMD_RegisterCommand("DevGroupShare", CMD_DGR_DevGroupShare, NULL);
-	CMD_RegisterCommand("DevGroupStatus", CMD_DGR_DevGroupStatus, NULL);
+	CMD_RegisterCommand("DevGroupStatus", CMD_DGR_DevGroupStatus, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupStatus1", CMD_DGR_DevGroupStatus, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupStatus2", CMD_DGR_DevGroupStatus, (void *)(intptr_t)1);
+	CMD_RegisterCommand("DevGroupStatus3", CMD_DGR_DevGroupStatus, (void *)(intptr_t)2);
+	CMD_RegisterCommand("DevGroupStatus4", CMD_DGR_DevGroupStatus, (void *)(intptr_t)3);
+	CMD_RegisterCommand("DevGroupTie", CMD_DGR_DevGroupTie, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupTie1", CMD_DGR_DevGroupTie, (void *)(intptr_t)0);
+	CMD_RegisterCommand("DevGroupTie2", CMD_DGR_DevGroupTie, (void *)(intptr_t)1);
+	CMD_RegisterCommand("DevGroupTie3", CMD_DGR_DevGroupTie, (void *)(intptr_t)2);
+	CMD_RegisterCommand("DevGroupTie4", CMD_DGR_DevGroupTie, (void *)(intptr_t)3);
 }
