@@ -3507,6 +3507,17 @@ int http_fn_cfg_startup(http_request_t* request) {
 #endif
 #if ENABLE_HTTP_DGR
 int http_fn_cfg_dgr(http_request_t* request) {
+	static const struct {
+		const char *label;
+		const char *key;
+		int code;
+		int mask;
+	} extraOptions[] = {
+		{ "Light Fade/Speed", "lfd", 4, DGR_SHARE_LIGHT_FADE },
+		{ "Light Scheme", "lsc", 8, DGR_SHARE_LIGHT_SCHEME },
+		{ "Dimmer Settings", "dim", 32, DGR_SHARE_DIMMER_SETTINGS },
+		{ "Event", "evt", 64, DGR_SHARE_EVENT }
+	};
 	char tmpA[128];
 	bool bForceSet;
 
@@ -3541,14 +3552,13 @@ int http_fn_cfg_dgr(http_request_t* request) {
 			newSendFlags |= DGR_SHARE_LIGHT_COLOR;
 		if (http_getArgInteger(request->url, "r_lcl"))
 			newRecvFlags |= DGR_SHARE_LIGHT_COLOR;
-		if (http_getArgInteger(request->url, "s_lfd")) newSendFlags |= DGR_SHARE_LIGHT_FADE;
-		if (http_getArgInteger(request->url, "r_lfd")) newRecvFlags |= DGR_SHARE_LIGHT_FADE;
-		if (http_getArgInteger(request->url, "s_lsc")) newSendFlags |= DGR_SHARE_LIGHT_SCHEME;
-		if (http_getArgInteger(request->url, "r_lsc")) newRecvFlags |= DGR_SHARE_LIGHT_SCHEME;
-		if (http_getArgInteger(request->url, "s_dim")) newSendFlags |= DGR_SHARE_DIMMER_SETTINGS;
-		if (http_getArgInteger(request->url, "r_dim")) newRecvFlags |= DGR_SHARE_DIMMER_SETTINGS;
-		if (http_getArgInteger(request->url, "s_evt")) newSendFlags |= DGR_SHARE_EVENT;
-		if (http_getArgInteger(request->url, "r_evt")) newRecvFlags |= DGR_SHARE_EVENT;
+		for (unsigned int i = 0; i < sizeof(extraOptions) / sizeof(extraOptions[0]); i++) {
+			char argumentName[8];
+			snprintf(argumentName, sizeof(argumentName), "s_%s", extraOptions[i].key);
+			if (http_getArgInteger(request->url, argumentName)) newSendFlags |= extraOptions[i].mask;
+			argumentName[0] = 'r';
+			if (http_getArgInteger(request->url, argumentName)) newRecvFlags |= extraOptions[i].mask;
+		}
 
 		CFG_DeviceGroups_SetName(tmpA);
 		for (int groupIndex = 1; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
@@ -3625,18 +3635,12 @@ int http_fn_cfg_dgr(http_request_t* request) {
 			poststr(request, " checked");
 		poststr(request, "></td> ");
 
-		poststr(request, "</tr><tr><td>Light Fade/Speed</td><td>4</td>");
-		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_lfd\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_lfd\" value=\"1\"%s></td>",
-			(newRecvFlags & DGR_SHARE_LIGHT_FADE) ? " checked" : "", (newSendFlags & DGR_SHARE_LIGHT_FADE) ? " checked" : "");
-		poststr(request, "</tr><tr><td>Light Scheme</td><td>8</td>");
-		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_lsc\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_lsc\" value=\"1\"%s></td>",
-			(newRecvFlags & DGR_SHARE_LIGHT_SCHEME) ? " checked" : "", (newSendFlags & DGR_SHARE_LIGHT_SCHEME) ? " checked" : "");
-		poststr(request, "</tr><tr><td>Dimmer Settings</td><td>32</td>");
-		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_dim\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_dim\" value=\"1\"%s></td>",
-			(newRecvFlags & DGR_SHARE_DIMMER_SETTINGS) ? " checked" : "", (newSendFlags & DGR_SHARE_DIMMER_SETTINGS) ? " checked" : "");
-		poststr(request, "</tr><tr><td>Event</td><td>64</td>");
-		hprintf255(request, "<td><input type=\"checkbox\" name=\"r_evt\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_evt\" value=\"1\"%s></td>",
-			(newRecvFlags & DGR_SHARE_EVENT) ? " checked" : "", (newSendFlags & DGR_SHARE_EVENT) ? " checked" : "");
+		for (unsigned int i = 0; i < sizeof(extraOptions) / sizeof(extraOptions[0]); i++) {
+			hprintf255(request, "</tr><tr><td>%s</td><td>%i</td><td><input type=\"checkbox\" name=\"r_%s\" value=\"1\"%s></td><td><input type=\"checkbox\" name=\"s_%s\" value=\"1\"%s></td>",
+				extraOptions[i].label, extraOptions[i].code, extraOptions[i].key,
+				(newRecvFlags & extraOptions[i].mask) ? " checked" : "", extraOptions[i].key,
+				(newSendFlags & extraOptions[i].mask) ? " checked" : "");
+		}
 
 		poststr(request, "<input type=\"hidden\" name=\"bSet\" value=\"1\">");
 

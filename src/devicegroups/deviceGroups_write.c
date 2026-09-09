@@ -116,20 +116,12 @@ int DGR_Quick_FormatFixedColor(byte *buffer, int maxSize, const char *groupName,
 
 // Format an ACK message (just header with ACK flag, no payload items)
 int DGR_Quick_FormatACK(byte *buffer, int maxSize, const char *groupName, uint16_t sequence) {
-	bitMessage_t msg;
-	MSG_BeginWriting(&msg, buffer, maxSize);
-	DGR_BeginWriting(&msg, groupName, sequence, 8);  // flags = DGR_FLAG_ACK
-	DRV_DGR_Dump(msg.data, msg.position);
-	return msg.position;
+	return DGR_Quick_FormatStatusRequestWithFlags(buffer, maxSize, groupName, sequence, DGR_FLAG_ACK);
 }
 
 // Format an Announcement message (heartbeat with just announcement flag)
 int DGR_Quick_FormatAnnouncement(byte *buffer, int maxSize, const char *groupName, uint16_t sequence) {
-	bitMessage_t msg;
-	MSG_BeginWriting(&msg, buffer, maxSize);
-	DGR_BeginWriting(&msg, groupName, sequence, 64);  // flags = DGR_FLAG_ANNOUNCEMENT
-	DRV_DGR_Dump(msg.data, msg.position);
-	return msg.position;
+	return DGR_Quick_FormatStatusRequestWithFlags(buffer, maxSize, groupName, sequence, DGR_FLAG_ANNOUNCEMENT);
 }
 
 // Format a Status Request message (asking other devices to send their status)
