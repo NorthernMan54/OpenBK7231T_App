@@ -3513,9 +3513,6 @@ int http_fn_cfg_dgr(http_request_t* request) {
 		int code;
 		int mask;
 	} extraOptions[] = {
-		{ "Light Fade/Speed", "lfd", 4, DGR_SHARE_LIGHT_FADE },
-		{ "Light Scheme", "lsc", 8, DGR_SHARE_LIGHT_SCHEME },
-		{ "Dimmer Settings", "dim", 32, DGR_SHARE_DIMMER_SETTINGS },
 		{ "Event", "evt", 64, DGR_SHARE_EVENT }
 	};
 	char tmpA[128];

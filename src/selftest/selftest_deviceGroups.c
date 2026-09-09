@@ -8,8 +8,11 @@
 void DGR_AddToSendQueue(byte *data, int len);
 void DGR_FlushSendQueue(void);
 int DGR_GetPendingPacketCountForTest(void);
+int DGR_GetPendingPacketByteForTest(int packetIndex, int byteIndex);
 int DGR_GetMemberCountForTest(void);
 int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline);
+int DGR_IsSequenceNewerForTest(uint16_t sequence, uint16_t previous);
+uint32_t DGR_TicksToMillisecondsForTest(uint32_t ticks);
 void SIM_SendFakeDGRPowerPacketToSelf(const char *groupName, int seq, int powerBits, int powerCount);
 
 static int sim_fakeSeq = 1;
@@ -90,14 +93,18 @@ static void Test_DeviceGroups_TruncatedItems(void) {
 }
 
 static void Test_DeviceGroups_QueueSaturation(void) {
-	byte packet[] = { 1, 2, 3 };
+	byte packet[] = { 0, 2, 3 };
 	int i;
 
 	DGR_FlushSendQueue();
 	for (i = 0; i < 8; i++) {
+		packet[0] = i;
 		DGR_AddToSendQueue(packet, sizeof(packet));
 	}
 	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 8);
+	for (i = 0; i < 8; i++) {
+		SELFTEST_ASSERT(DGR_GetPendingPacketByteForTest(i, 0) == i);
+	}
 	DGR_AddToSendQueue(packet, sizeof(packet));
 	SELFTEST_ASSERT(DGR_GetPendingPacketCountForTest() == 8);
 	DGR_FlushSendQueue();
@@ -328,6 +335,14 @@ static void Test_DeviceGroups_WrapSafeTimer(void) {
 	SELFTEST_ASSERT(!DGR_IsTimeReachedForTest(99, 100));
 	SELFTEST_ASSERT(DGR_IsTimeReachedForTest(5, 0xFFFFFFF0));
 	SELFTEST_ASSERT(!DGR_IsTimeReachedForTest(0xFFFFFFF0, 5));
+	SELFTEST_ASSERT(DGR_TicksToMillisecondsForTest(10) == 10 * portTICK_PERIOD_MS);
+}
+
+static void Test_DeviceGroups_WrapSafeSequence(void) {
+	SELFTEST_ASSERT(DGR_IsSequenceNewerForTest(101, 100));
+	SELFTEST_ASSERT(!DGR_IsSequenceNewerForTest(100, 100));
+	SELFTEST_ASSERT(!DGR_IsSequenceNewerForTest(99, 100));
+	SELFTEST_ASSERT(DGR_IsSequenceNewerForTest(1, 0xFFFF));
 }
 
 void SIM_SendFakeDGRPowerPacketToSelf(const char *groupName, int seq, int powerBits, int powerCount) {
@@ -503,6 +518,7 @@ void Test_DeviceGroups() {
 	Test_DeviceGroups_MultipleGroupsAndTies();
 	Test_DeviceGroups_ACKGroupFiltering();
 	Test_DeviceGroups_WrapSafeTimer();
+	Test_DeviceGroups_WrapSafeSequence();
 
 	Test_DeviceGroups_TwoRelays();
 	Test_DeviceGroups_RGB();

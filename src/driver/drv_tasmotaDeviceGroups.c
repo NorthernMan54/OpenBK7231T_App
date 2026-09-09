@@ -109,6 +109,10 @@ struct sockaddr_in g_mySockAddr;
 
 const char *HAL_GetMyIPString();
 
+static uint32_t DGR_TicksToMilliseconds(uint32_t ticks) {
+	return ticks * portTICK_PERIOD_MS;
+}
+
 void DRV_DGR_Dump(byte *message, int len);
 void DRV_DGR_SendFullStatus(const char *groupName);
 
@@ -160,6 +164,7 @@ typedef struct dgrPacket_s {
 
 // the list is not allocated before first use
 dgrPacket_t *dgr_pending = 0;
+dgrPacket_t *dgr_pending_tail = 0;
 int dgr_total_alloced_queue_size = 0;
 
 static SemaphoreHandle_t g_mutex = 0;
@@ -204,8 +209,13 @@ static bool DGR_AddToSendQueueInternal(byte *data, int len, uint32_t target_ip) 
 			return false;
 		}
 		dgr_total_alloced_queue_size++;
-		p->next = dgr_pending;
-		dgr_pending = p;
+		p->next = 0;
+		if (dgr_pending_tail) {
+			dgr_pending_tail->next = p;
+		} else {
+			dgr_pending = p;
+		}
+		dgr_pending_tail = p;
 	}
 	p->length = len;
 	p->target_ip = target_ip;
@@ -229,7 +239,7 @@ static void DGR_RecordReliableMessage(byte *data, int len, uint16_t sequence) {
 	g_dgr_reliable_message_length = len;
 	g_dgr_reliable_sequence = sequence;
 	g_dgr_ack_check_interval = DGR_ACK_INITIAL_INTERVAL;
-	now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+	now = DGR_TicksToMilliseconds(xTaskGetTickCount());
 	g_dgr_next_ack_check_time = now + g_dgr_ack_check_interval;
 	g_dgr_member_timeout_time = now + DGR_MEMBER_TIMEOUT;
 	g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL;
@@ -311,6 +321,30 @@ int DGR_GetPendingPacketCountForTest(void) {
 	}
 	xSemaphoreGive(g_mutex);
 	return count;
+}
+
+int DGR_GetPendingPacketByteForTest(int packetIndex, int byteIndex) {
+	dgrPacket_t *p;
+	int pendingIndex = 0;
+	int result = -1;
+	bool taken;
+	if (packetIndex < 0 || byteIndex < 0 || g_mutex == 0) {
+		return -1;
+	}
+	taken = xSemaphoreTake(g_mutex, 10);
+	if (taken == false) {
+		return -1;
+	}
+	for (p = dgr_pending; p; p = p->next) {
+		if (p->length == 0) continue;
+		if (pendingIndex == packetIndex) {
+			if (byteIndex < p->length) result = p->buffer[byteIndex];
+			break;
+		}
+		pendingIndex++;
+	}
+	xSemaphoreGive(g_mutex);
+	return result;
 }
 
 #endif
@@ -629,6 +663,10 @@ dgrMember_t *findMember() {
 	return &g_dgrMembers[i];
 }
 
+static bool DGR_IsSequenceNewer(uint16_t sequence, uint16_t previous) {
+	return previous == 0 || (int16_t)(sequence - previous) > 0;
+}
+
 int DGR_CheckSequence(uint16_t seq) {
 	dgrMember_t *m;
 
@@ -640,12 +678,9 @@ int DGR_CheckSequence(uint16_t seq) {
 	}
 	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "DGR_CheckSequence: argument %i, last %i",(int)seq, (int)m->lastSeq);
 	
-	// Match Tasmota v9.5.0 duplicate detection, including uint16 wrap-around.
-	if (seq <= m->lastSeq) {
-		if (seq == m->lastSeq || (uint16_t)(m->lastSeq - seq) > 64536) {
-			addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq failed");
-			return 1;
-		}
+	if (!DGR_IsSequenceNewer(seq, m->lastSeq)) {
+		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq failed");
+		return 1;
 	}
 	m->lastSeq = seq;
 	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR, "Seq ok");
@@ -657,8 +692,10 @@ void DGR_HandleIncomingACK(uint16_t seq) {
 	if (m == 0) {
 		return;
 	}
-	// Accept if newer, or handles uint16 wrap-around (matching Tasmota's logic: < 64536)
-	if (seq > m->acked_sequence || (m->acked_sequence - seq) < 64536) {
+	/* Sequence zero is not transmitted and therefore serves as the initial
+	 * sentinel.  The signed delta handles normal uint16_t wrap-around without
+	 * allowing a delayed ACK to move the member backwards. */
+	if (DGR_IsSequenceNewer(seq, m->acked_sequence)) {
 		m->acked_sequence = seq;
 	}
 }
@@ -668,7 +705,7 @@ static bool DGR_TimeReached(uint32_t now, uint32_t deadline) {
 }
 
 static void DGR_StartDiscovery(void) {
-	uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+	uint32_t now = DGR_TicksToMilliseconds(xTaskGetTickCount());
 	g_dgr_initial_discovery_remaining = 10;
 	g_dgr_discovery_sequence = g_dgr_send_seq++;
 	if (g_dgr_send_seq == 0) {
@@ -683,6 +720,12 @@ static void DGR_StartDiscovery(void) {
 #if WINDOWS
 int DGR_IsTimeReachedForTest(uint32_t now, uint32_t deadline) {
 	return DGR_TimeReached(now, deadline);
+}
+int DGR_IsSequenceNewerForTest(uint16_t sequence, uint16_t previous) {
+	return DGR_IsSequenceNewer(sequence, previous);
+}
+uint32_t DGR_TicksToMillisecondsForTest(uint32_t ticks) {
+	return DGR_TicksToMilliseconds(ticks);
 }
 #endif
 
@@ -721,7 +764,7 @@ void DRV_DGR_RunEverySecond() {
 		return;
 	}
 
-	now = xTaskGetTickCount() / portTICK_PERIOD_MS;  // Current time in milliseconds
+	now = DGR_TicksToMilliseconds(xTaskGetTickCount());  // Current time in milliseconds
 	for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
 		groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
 		if (!groupName[0]) continue;
@@ -901,6 +944,7 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	char groupName[32];
 	uint16_t sequence;
 	uint16_t flags;
+	dgrMember_t *member;
 
 	if (msgbuf == 0 || nbytes <= 0 || nbytes >= 128) {
 		return;
@@ -926,8 +970,15 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 		return;
 	}
 	g_dgr_incoming_flags = flags;
-	if (findMember() == 0) {
+	member = findMember();
+	if (member == 0) {
 		return;
+	}
+	/* A peer starts discovery with RESET|STATUS_REQUEST after reboot. Seed its
+	 * receive sequence here so its following low-numbered status update is not
+	 * rejected as stale state from the previous boot. */
+	if (flags & DGR_FLAG_RESET) {
+		member->lastSeq = sequence;
 	}
 
 	// Intercept ACKs before DGR_Parse — update acked_sequence only, never lastSeq
@@ -987,7 +1038,7 @@ void DRV_DGR_RunQuickTick() {
 		return ;
 	}
 	{
-		uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
+		uint32_t now = DGR_TicksToMilliseconds(xTaskGetTickCount());
 		int groupIndex;
 		for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
 			if (!CFG_DeviceGroups_GetNameByIndex(groupIndex)[0]) continue;
