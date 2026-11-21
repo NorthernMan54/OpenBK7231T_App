@@ -734,24 +734,31 @@ uint32_t DGR_TicksToMillisecondsForTest(uint32_t ticks) {
 }
 #endif
 
-// Re-issues IP_ADD_MEMBERSHIP on the existing receive socket. Cheap, and safe to call
-// repeatedly — if we're already a member, the join just fails harmlessly and we log it
-// at debug level. This is the fix for upstream multicast state getting reset (AP/switch
-// IGMP snooping table flush, AP-side multicast-enhancement membership expiry) without
-// this device ever seeing a link-down event to react to.
+// Leaves and re-joins the multicast group on the existing receive socket, for when
+// upstream multicast state was reset (AP/switch IGMP snooping table flush, AP-side
+// multicast-enhancement membership expiry) without a link-down event.
+//
+// The DROP must come first. lwIP 2.0.x records every IP_ADD_MEMBERSHIP in a small
+// per-stack table (LWIP_SOCKET_MAX_MEMBERSHIPS == NUM_SOCKETS) with no duplicate
+// check, and a repeat join of an already-joined group only bumps the IGMP use count
+// without sending a report. Repeated ADDs therefore leak table slots until every
+// IP_ADD_MEMBERSHIP on the device fails (e.g. the DDP driver's). DROP+ADD keeps the
+// table balanced and, when DGR is the group's only user, sends a fresh IGMP report.
 static void DGR_RejoinMulticastGroup(void) {
 	struct ip_mreq mreq;
-	int iResult;
+	int dropResult, addResult;
 
 	if (g_dgr_socket_receive <= 0) {
 		return;
 	}
 	mreq.imr_multiaddr.s_addr = inet_addr(dgr_group);
 	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-	iResult = setsockopt(g_dgr_socket_receive, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+	dropResult = setsockopt(g_dgr_socket_receive, IPPROTO_IP, IP_DROP_MEMBERSHIP,
 		(char*) &mreq, sizeof(mreq));
-	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR,
-		"DGR_RejoinMulticastGroup: IP_ADD_MEMBERSHIP refresh result %i", iResult);
+	addResult = setsockopt(g_dgr_socket_receive, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+		(char*) &mreq, sizeof(mreq));
+	addLogAdv(addResult < 0 ? LOG_INFO : LOG_EXTRADEBUG, LOG_FEATURE_DGR,
+		"DGR_RejoinMulticastGroup: drop %i, add %i", dropResult, addResult);
 }
 
 // Full teardown/recreate of both sockets plus a fresh discovery burst on every
@@ -836,7 +843,6 @@ void DRV_DGR_RunEverySecond() {
 		if (!g_dgr_initial_discovery_remaining && DGR_TimeReached(now, g_dgr_next_announcement_time)) {
 			DRV_DGR_SendAnnouncement(groupName);
 			g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL + (rand() % 10000);
-			DGR_RejoinMulticastGroup();   // NEW: unconditional, cheap, piggybacked on the heartbeat
 		}
 
 		// NEW: group-silence watchdog
