@@ -13,6 +13,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/inet.h"
 #include "../httpserver/new_http.h"
+#include <errno.h>
 
 /* FreeRTOS compatibility: portTICK_PERIOD_MS fallback
    TXW81X and OpenRDA5981 don't define portTICK_PERIOD_MS.
@@ -51,6 +52,8 @@ typedef struct dgrRuntime_s {
 	int retry_member_cursor;
 	dgrMember_t members[MAX_DGR_MEMBERS];
 	int member_count;
+	uint32_t last_group_rx_time;   // NEW: last time ANY valid packet arrived from a known member
+	byte resubscribe_attempted;    // NEW: cheap rejoin already tried for this silence episode
 } dgrRuntime_t;
 
 static dgrRuntime_t g_dgr_groups[CFG_DEVICE_GROUP_MAX];
@@ -74,6 +77,8 @@ static int g_dgr_current_index = 0;
 #define g_dgr_retry_member_cursor (g_dgr_current->retry_member_cursor)
 #define g_dgrMembers (g_dgr_current->members)
 #define g_curDGRMembers (g_dgr_current->member_count)
+#define g_dgr_last_group_rx_time (g_dgr_current->last_group_rx_time)   // NEW
+#define g_dgr_resubscribe_attempted (g_dgr_current->resubscribe_attempted)   // NEW
 
 static void DRV_DGR_ProcessTextCommand(const char *value, byte length) {
 	char command[MAX_DGR_PACKET];
@@ -729,6 +734,65 @@ uint32_t DGR_TicksToMillisecondsForTest(uint32_t ticks) {
 }
 #endif
 
+// Re-issues IP_ADD_MEMBERSHIP on the existing receive socket. Cheap, and safe to call
+// repeatedly — if we're already a member, the join just fails harmlessly and we log it
+// at debug level. This is the fix for upstream multicast state getting reset (AP/switch
+// IGMP snooping table flush, AP-side multicast-enhancement membership expiry) without
+// this device ever seeing a link-down event to react to.
+static void DGR_RejoinMulticastGroup(void) {
+	struct ip_mreq mreq;
+	int iResult;
+
+	if (g_dgr_socket_receive <= 0) {
+		return;
+	}
+	mreq.imr_multiaddr.s_addr = inet_addr(dgr_group);
+	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+	iResult = setsockopt(g_dgr_socket_receive, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+		(char*) &mreq, sizeof(mreq));
+	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_DGR,
+		"DGR_RejoinMulticastGroup: IP_ADD_MEMBERSHIP refresh result %i", iResult);
+}
+
+// Full teardown/recreate of both sockets plus a fresh discovery burst on every
+// configured group. This is the escalation path for when a cheap rejoin didn't help —
+// covers the receive socket itself being wedged, not just stale multicast membership.
+static void DGR_RebuildSocketsAndRediscover(void) {
+	int groupIndex;
+	const char *groupName;
+
+	if (g_dgr_socket_receive > 0) {
+#if WINDOWS
+		closesocket(g_dgr_socket_receive);
+#else
+		close(g_dgr_socket_receive);
+#endif
+		g_dgr_socket_receive = -1;
+	}
+	if (g_dgr_socket_send > 0) {
+#if WINDOWS
+		closesocket(g_dgr_socket_send);
+#else
+		close(g_dgr_socket_send);
+#endif
+		g_dgr_socket_send = -1;
+	}
+	DRV_DGR_CreateSocket_Receive();
+	DRV_DGR_CreateSocket_Send();
+	if (g_dgr_socket_receive > 0 && g_dgr_socket_send > 0) {
+		for (groupIndex = 0; groupIndex < CFG_DEVICE_GROUP_MAX; groupIndex++) {
+			groupName = CFG_DeviceGroups_GetNameByIndex(groupIndex);
+			if (groupName[0]) {
+				DGR_SelectGroup(groupIndex);
+				DGR_StartDiscovery();
+				g_dgr_last_group_rx_time = 0;
+				g_dgr_resubscribe_attempted = 0;
+			}
+		}
+	}
+	dgr_retry_time_left = 5;
+}
+
 void DRV_DGR_RunEverySecond() {
 	const char *myip;
 	uint32_t now;
@@ -772,6 +836,27 @@ void DRV_DGR_RunEverySecond() {
 		if (!g_dgr_initial_discovery_remaining && DGR_TimeReached(now, g_dgr_next_announcement_time)) {
 			DRV_DGR_SendAnnouncement(groupName);
 			g_dgr_next_announcement_time = now + DGR_ANNOUNCEMENT_INTERVAL + (rand() % 10000);
+			DGR_RejoinMulticastGroup();   // NEW: unconditional, cheap, piggybacked on the heartbeat
+		}
+
+		// NEW: group-silence watchdog
+		if (!g_dgr_initial_discovery_remaining && g_curDGRMembers > 0 && g_dgr_last_group_rx_time) {
+			uint32_t silentFor = now - g_dgr_last_group_rx_time;
+			if (!g_dgr_resubscribe_attempted
+				&& silentFor >= (DGR_ANNOUNCEMENT_INTERVAL * 2 + 10000)) {
+				addLogAdv(LOG_INFO, LOG_FEATURE_DGR,
+					"DGR: no traffic from any of %i members of %s for %lums, re-joining multicast group",
+					g_curDGRMembers, groupName, (unsigned long)silentFor);
+				DGR_RejoinMulticastGroup();
+				g_dgr_resubscribe_attempted = 1;
+			} else if (g_dgr_resubscribe_attempted
+				&& silentFor >= (DGR_ANNOUNCEMENT_INTERVAL * 3 + 15000)) {
+				addLogAdv(LOG_INFO, LOG_FEATURE_DGR,
+					"DGR: still no traffic on %s after rejoin, rebuilding sockets",
+					groupName);
+				DGR_RebuildSocketsAndRediscover();
+				return;   // socket/group state was just reset for every group this tick
+			}
 		}
 	}
 }
@@ -974,6 +1059,10 @@ void DGR_ProcessIncomingPacket(char *msgbuf, int nbytes) {
 	if (member == 0) {
 		return;
 	}
+
+	g_dgr_last_group_rx_time = DGR_TicksToMilliseconds(xTaskGetTickCount());   // NEW
+	g_dgr_resubscribe_attempted = 0;   // NEW: heard something — clear any pending escalatio
+
 	/* A peer starts discovery with RESET|STATUS_REQUEST after reboot. Seed its
 	 * receive sequence here so its following low-numbered status update is not
 	 * rejected as stale state from the previous boot. */
@@ -1062,6 +1151,16 @@ void DRV_DGR_RunQuickTick() {
 			&addrlen
 		);
 		if (nbytes <= 0) {
+			if (nbytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+				addLogAdv(LOG_INFO, LOG_FEATURE_DGR,
+					"DRV_DGR_RunQuickTick: recvfrom error %i, closing socket for rebuild", errno);
+#if WINDOWS
+				closesocket(g_dgr_socket_receive);
+#else
+				close(g_dgr_socket_receive);
+#endif
+				g_dgr_socket_receive = -1;
+			}
 			return;
 		}
 
