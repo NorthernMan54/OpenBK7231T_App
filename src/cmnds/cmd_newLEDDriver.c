@@ -685,7 +685,7 @@ void apply_smart_light() {
 		LED_I2CDriver_WriteRGBCW(finalColors);
 	}
 
-	if(CFG_HasFlag(OBK_FLAG_LED_REMEMBERLASTSTATE)) {
+	if(CFG_HasFlag(OBK_FLAG_LED_REMEMBERLASTSTATE) && !DDP_IsRealtimeActive()) {
 		// something was changed, mark as dirty
 		g_ledStateSavePending = 1;
 	}
@@ -705,7 +705,9 @@ void apply_smart_light() {
 	// I am not sure if it's the best place to do it
 	// NOTE: this will broadcast MQTT only if a flag is set
 #if ENABLE_MQTT
-	sendFullRGBCW_IfEnabled();
+	if (!DDP_IsRealtimeActive()) {
+		sendFullRGBCW_IfEnabled();
+	}
 #endif
 }
 
@@ -988,6 +990,49 @@ void LED_SetEnableAll(int bEnable) {
 }
 int LED_GetEnableAll() {
 	return g_lightEnableAll;
+}
+
+static struct {
+	byte valid;
+	byte enableAll;
+	byte lightMode;
+	float baseColors[5];
+	float brightness0to100;
+	float temperature;
+	float hsv_h, hsv_s, hsv_v;
+} g_ledSnapshot;
+
+void LED_SaveSnapshot() {
+	int i;
+	for (i = 0; i < 5; i++) {
+		g_ledSnapshot.baseColors[i] = led_baseColors[i];
+	}
+	g_ledSnapshot.enableAll = g_lightEnableAll;
+	g_ledSnapshot.lightMode = g_lightMode;
+	g_ledSnapshot.brightness0to100 = g_brightness0to100;
+	g_ledSnapshot.temperature = led_temperature_current;
+	g_ledSnapshot.hsv_h = g_hsv_h;
+	g_ledSnapshot.hsv_s = g_hsv_s;
+	g_ledSnapshot.hsv_v = g_hsv_v;
+	g_ledSnapshot.valid = 1;
+}
+void LED_RestoreSnapshot() {
+	int i;
+	if (!g_ledSnapshot.valid) {
+		return;
+	}
+	g_ledSnapshot.valid = 0;
+	for (i = 0; i < 5; i++) {
+		led_baseColors[i] = g_ledSnapshot.baseColors[i];
+	}
+	g_lightMode = g_ledSnapshot.lightMode;
+	led_temperature_current = g_ledSnapshot.temperature;
+	g_hsv_h = g_ledSnapshot.hsv_h;
+	g_hsv_s = g_ledSnapshot.hsv_s;
+	g_hsv_v = g_ledSnapshot.hsv_v;
+	// These apply the restored colour and publish dimmer/power as usual.
+	LED_SetDimmer((int)(g_ledSnapshot.brightness0to100 + 0.5f));
+	LED_SetEnableAll(g_ledSnapshot.enableAll);
 }
 static commandResult_t enableAll(const void *context, const char *cmd, const char *args, int cmdFlags){
 	//if (!wal_strnicmp(cmd, "POWERALL", 8)){

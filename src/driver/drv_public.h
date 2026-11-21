@@ -92,5 +92,15 @@ bool TuyaMCU_IsLEDRunning();
 
 void Shutter_MoveByIndex(int index, float frac, bool bStopOnDuplicate);
 
+// DDP realtime mode: true while DDP frames are arriving (and for a short timeout
+// after the last one). Local state changes are then not shared over DGR/MQTT and
+// incoming DGR light/power messages are ignored, so per-bulb DDP pixels in a DGR
+// group don't overwrite each other.
+#if ENABLE_DRIVER_DDP
+int DDP_IsRealtimeActive(void);
+#else
+#define DDP_IsRealtimeActive() 0
+#endif
+
 #endif /* __DRV_PUBLIC_H__ */
 

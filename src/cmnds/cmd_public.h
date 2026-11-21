@@ -283,6 +283,10 @@ bool LED_IsLEDRunning();
 void LED_SetEnableAll(int bEnable);
 void LED_SetStripStateOutputs();
 int LED_GetEnableAll();
+// Save / restore the user-visible light state (power, dimmer, colour, mode,
+// temperature). Used by DDP realtime mode to return to the pre-show state.
+void LED_SaveSnapshot();
+void LED_RestoreSnapshot();
 void LED_SaveStateToFlashVarsNow();
 void LED_GetBaseColorString(char* s);
 void LED_SetBaseColorByIndex(int i, float f, bool bApply);

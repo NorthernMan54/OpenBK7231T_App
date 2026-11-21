@@ -12,6 +12,7 @@
 #include "lwip/inet.h"
 #include "../httpserver/new_http.h"
 #include "drv_local.h"
+#include "../quicktick.h"
 
 #if ENABLE_DRIVER_SM16703P
 #include "drv_spiLED.h"
@@ -25,6 +26,32 @@ int stat_ddpPacketsReceived = 0;
 static int stat_ddpBytesReceived = 0;
 static char *g_ddp_buffer = 0;
 static int g_ddp_bufferSize = 512;
+
+// Realtime mode (see DDP_IsRealtimeActive in drv_public.h)
+#define DDP_REALTIME_TIMEOUT_MS 2500
+static int g_ddp_realtimeActive = 0;
+static unsigned int g_ddp_realtimeIdleMs = 0;
+
+int DDP_IsRealtimeActive(void) {
+	return g_ddp_realtimeActive;
+}
+static void DDP_BeginRealtime(void) {
+	g_ddp_realtimeIdleMs = 0;
+	if (g_ddp_realtimeActive) {
+		return;
+	}
+	// Set before switching on, so the power-on itself is not shared over DGR.
+	g_ddp_realtimeActive = 1;
+#if ENABLE_LED_BASIC
+	LED_SaveSnapshot();
+#endif
+	addLogAdv(LOG_INFO, LOG_FEATURE_DDP, "realtime start");
+#if ENABLE_LED_BASIC
+	if (!LED_GetEnableAll()) {
+		LED_SetEnableAll(1);
+	}
+#endif
+}
 
 void DRV_DDP_CreateSocket_Receive() {
 
@@ -109,10 +136,8 @@ void DRV_DDP_CreateSocket_Receive() {
 		if (
 			iResult < 0
 		){
-			addLogAdv(LOG_INFO, LOG_FEATURE_DDP,"failed to do setsockopt IP_ADD_MEMBERSHIP %i",iResult);
-			close(g_ddp_socket_receive);
-			g_ddp_socket_receive = -1;
-			return ;
+			// Not fatal: unicast DDP (what WLED sends) still works without the group.
+			addLogAdv(LOG_INFO, LOG_FEATURE_DDP,"failed to do setsockopt IP_ADD_MEMBERSHIP %i, unicast only",iResult);
 		}
 	}
 
@@ -145,6 +170,8 @@ void DDP_Parse(byte *data, int len) {
 
 			//addLogAdv(LOG_INFO, LOG_FEATURE_DDP, "DDP_Parse: bulb path");
 
+			DDP_BeginRealtime();
+
 #if ENABLE_LED_BASIC
 			LED_SetDimmerIfChanged(100);
 			if (data[9] == 4) {
@@ -160,6 +187,18 @@ void DDP_Parse(byte *data, int len) {
 void DRV_DDP_RunFrame() {
 	struct sockaddr_in addr;
 	int nbytes;
+
+	if (g_ddp_realtimeActive) {
+		g_ddp_realtimeIdleMs += g_deltaTimeMS;
+		if (g_ddp_realtimeIdleMs >= DDP_REALTIME_TIMEOUT_MS) {
+			g_ddp_realtimeActive = 0;
+			addLogAdv(LOG_INFO, LOG_FEATURE_DDP, "realtime end, restoring pre-show state");
+#if ENABLE_LED_BASIC
+			// Flag cleared first, so the restored state is published normally.
+			LED_RestoreSnapshot();
+#endif
+		}
+	}
 
 	if(g_ddp_socket_receive<0) {
 		g_retry_delay--;
@@ -200,6 +239,12 @@ void DRV_DDP_RunFrame() {
 }
 void DRV_DDP_Shutdown()
 {
+	if (g_ddp_realtimeActive) {
+		g_ddp_realtimeActive = 0;
+#if ENABLE_LED_BASIC
+		LED_RestoreSnapshot();
+#endif
+	}
 	if(g_ddp_socket_receive>=0) {
 		close(g_ddp_socket_receive);
 		g_ddp_socket_receive = -1;
@@ -210,7 +255,8 @@ void DRV_DDP_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreS
 	if (bPreState){
 		return;
 	}
-	hprintf255(request, "<h2>DDP received: %i packets, %i bytes</h2>", stat_ddpPacketsReceived, stat_ddpBytesReceived);
+	hprintf255(request, "<h2>DDP received: %i packets, %i bytes%s</h2>", stat_ddpPacketsReceived, stat_ddpBytesReceived,
+		g_ddp_realtimeActive ? " (realtime)" : "");
 }
 void DRV_DDP_Init()
 {

@@ -5,6 +5,7 @@
 #include "../new_cfg.h"
 // Commands register, execution API and cmd tokenizer
 #include "../cmnds/cmd_public.h"
+#include "../driver/drv_public.h"
 #include "../logging/logging.h"
 #include "../devicegroups/deviceGroups_public.h"
 #include "../devicegroups/deviceGroups_local.h"
@@ -574,6 +575,9 @@ void DRV_DGR_CreateSocket_Receive() {
 
 #if ENABLE_LED_BASIC
 void DRV_DGR_processRGBCW(byte *rgbcw) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR, "DRV_DGR_setFinalRGBCW: %i,%i,%i,%i,%i", (int)rgbcw[0], (int)rgbcw[1], (int)rgbcw[2], (int)rgbcw[3], (int)rgbcw[4]);
 
 	LED_SetFinalRGBCW(rgbcw);
@@ -583,6 +587,10 @@ void DRV_DGR_processPower(int relayStates, byte relaysCount) {
 	int startIndex;
 	int i;
 	int ch;
+
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR, "DRV_DGR_processPower: cnt %i, val %i", (int)relaysCount, relayStates);
 
@@ -624,16 +632,25 @@ void DRV_DGR_processPower(int relayStates, byte relaysCount) {
 }
 #if ENABLE_LED_BASIC
 void DRV_DGR_processBrightnessPowerOn(byte brightness) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DRV_DGR_processBrightnessPowerOn: %i",(int)brightness);
 
 	LED_SetDimmer(Val255ToVal100(brightness));
 }
 void DRV_DGR_processLightFixedColor(byte fixedColor) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR, "DRV_DGR_processLightFixedColor: %i", (int)fixedColor);
 
 	LED_SetColorByIndex(fixedColor);
 }
 void DRV_DGR_processLightBrightness(byte brightness) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	addLogAdv(LOG_DEBUG, LOG_FEATURE_DGR,"DRV_DGR_processLightBrightness: %i",(int)brightness);
 
 	LED_SetDimmer(Val255ToVal100(brightness));
@@ -1237,6 +1254,9 @@ commandResult_t CMD_DGR_SendPower(const void *context, const char *cmd, const ch
 	return CMD_RES_OK;
 }
 void DRV_DGR_OnLedDimmerChange(int iVal) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	//addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DRV_DGR_OnLedDimmerChange: called");
 	if (g_dgr_socket_receive == 0) {
 		return;
@@ -1254,6 +1274,9 @@ void DRV_DGR_OnLedDimmerChange(int iVal) {
 }
 
 void DRV_DGR_OnLedFinalColorsChange(byte rgbcw[5]) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	//addLogAdv(LOG_INFO, LOG_FEATURE_DGR,"DRV_DGR_OnLedFinalColorsChange: called");
 	if (g_dgr_socket_receive == 0) {
 		return;
@@ -1272,6 +1295,9 @@ void DRV_DGR_OnLedFinalColorsChange(byte rgbcw[5]) {
 
 
 void DRV_DGR_OnLedEnableAllChange(int iVal) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	if(g_dgr_socket_receive==0) {
 		return;
 	}
@@ -1289,6 +1315,9 @@ void DRV_DGR_OnLedEnableAllChange(int iVal) {
 	DRV_DGR_Send_Power(CFG_DeviceGroups_GetName(), iVal, 1);
 }
 void DRV_DGR_OnChannelChanged(int ch, int value) {
+	if (DDP_IsRealtimeActive()) {
+		return;
+	}
 	int channelValues;
 	int channelsCount;
 	int i;
